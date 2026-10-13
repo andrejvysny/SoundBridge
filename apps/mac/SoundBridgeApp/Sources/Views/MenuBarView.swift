@@ -21,14 +21,18 @@ private let soundbridgeFont: Font = {
 struct MenuBarView: View {
     @StateObject private var volumeController = VolumeController.shared
     @StateObject private var eqController = EQController(deviceUID: "default")
-    @State private var showDeviceList = false
 
     var body: some View {
         VStack(spacing: 0) {
-            // 1. Device name header + dropdown arrow
-            DeviceHeader(
-                deviceName: volumeController.activeDeviceName,
-                isExpanded: $showDeviceList
+            // 1. Output device picker, always visible
+            SectionLabel(title: "Output")
+
+            DeviceListSection(
+                devices: volumeController.allDevices,
+                activeUID: volumeController.activeDeviceUID,
+                onSelect: { device in
+                    volumeController.switchDevice(to: device)
+                }
             )
 
             Divider()
@@ -65,19 +69,7 @@ struct MenuBarView: View {
             Divider()
                 .padding(.horizontal, 12)
 
-            // 3. Device list (expandable)
-            if showDeviceList {
-                DeviceListSection(
-                    devices: volumeController.allDevices,
-                    activeUID: volumeController.activeDeviceUID,
-                    onSelect: { device in
-                        volumeController.switchDevice(to: device)
-                        showDeviceList = false
-                    }
-                )
-            }
-
-            // 4. Reconnect audio + Footer
+            // 3. Reconnect audio + Footer
             ReconnectAudioButton()
                 .padding(.horizontal, 8)
                 .padding(.vertical, 4)
@@ -96,35 +88,21 @@ struct MenuBarView: View {
     }
 }
 
-// MARK: - Device Header
+// MARK: - Section Label
 
-struct DeviceHeader: View {
-    let deviceName: String
-    @Binding var isExpanded: Bool
+struct SectionLabel: View {
+    let title: String
 
     var body: some View {
-        Button(action: { isExpanded.toggle() }) {
-            HStack {
-                Image(systemName: "speaker.wave.2.fill")
-                    .font(.system(size: 13))
-                    .foregroundColor(.secondary)
-
-                Text(deviceName.isEmpty ? "No Device" : deviceName)
-                    .font(.system(size: 13, weight: .medium))
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-
-                Spacer()
-
-                Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundColor(.secondary)
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 10)
-            .contentShape(Rectangle())
+        HStack {
+            Text(title)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(.secondary)
+            Spacer()
         }
-        .buttonStyle(.plain)
+        .padding(.horizontal, 16)
+        .padding(.top, 10)
+        .padding(.bottom, 2)
     }
 }
 
@@ -178,22 +156,51 @@ struct DeviceListSection: View {
     let onSelect: (OutputDevice) -> Void
 
     var body: some View {
+        let names = displayNames
         VStack(spacing: 2) {
+            if devices.isEmpty {
+                Text("No output devices")
+                    .font(.system(size: 12))
+                    .foregroundColor(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+            }
             ForEach(devices) { device in
                 DeviceRow(
                     device: device,
+                    title: names[device.uid] ?? device.name,
                     isActive: device.uid == activeUID,
                     onSelect: { onSelect(device) }
                 )
             }
         }
         .padding(.horizontal, 8)
-        .padding(.vertical, 6)
+        .padding(.bottom, 6)
+    }
+
+    /// Identical monitors report identical names; number repeats so rows stay distinguishable.
+    private var displayNames: [String: String] {
+        var totals: [String: Int] = [:]
+        for device in devices { totals[device.name, default: 0] += 1 }
+        var seen: [String: Int] = [:]
+        var result: [String: String] = [:]
+        for device in devices {
+            guard totals[device.name, default: 0] > 1 else {
+                result[device.uid] = device.name
+                continue
+            }
+            let index = seen[device.name, default: 0] + 1
+            seen[device.name] = index
+            result[device.uid] = "\(device.name) (\(index))"
+        }
+        return result
     }
 }
 
 struct DeviceRow: View {
     let device: OutputDevice
+    let title: String
     let isActive: Bool
     let onSelect: () -> Void
     @State private var isHovered = false
@@ -205,8 +212,8 @@ struct DeviceRow: View {
                     .font(.system(size: 12))
                     .foregroundColor(isActive ? .accentColor : .secondary)
 
-                Text(device.name)
-                    .font(.system(size: 12))
+                Text(title)
+                    .font(.system(size: 12, weight: isActive ? .medium : .regular))
                     .lineLimit(1)
                     .truncationMode(.tail)
 

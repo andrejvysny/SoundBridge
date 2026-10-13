@@ -2,22 +2,43 @@ import SwiftUI
 
 struct BasicEQView: View {
     @ObservedObject var eqController: EQController
+    // Collapsed by default: EQ is set once and rarely touched, volume is the main control.
+    @State private var isExpanded = false
 
     var body: some View {
         VStack(spacing: 6) {
-            // EQ toggle (sub-task 3.2)
+            // EQ toggle stays reachable while the sliders are collapsed
             HStack {
-                Text("EQ")
-                    .font(.system(size: 12, weight: .medium))
-                Spacer()
+                Button(action: { isExpanded.toggle() }) {
+                    HStack(spacing: 6) {
+                        Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundColor(.secondary)
+                            .frame(width: 10)
+                        Text("EQ")
+                            .font(.system(size: 12, weight: .medium))
+                        Spacer()
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+
                 Toggle("", isOn: $eqController.isEnabled)
                     .toggleStyle(.switch)
                     .controlSize(.mini)
                     .labelsHidden()
             }
             .padding(.horizontal, 16)
-            .padding(.top, 6)
+            .padding(.vertical, 6)
 
+            if isExpanded {
+                expandedControls
+            }
+        }
+    }
+
+    private var expandedControls: some View {
+        VStack(spacing: 6) {
             // Sliders area with bypass visual feedback (sub-tasks 3.3, 3.5)
             VStack(spacing: 4) {
                 EQSliderRow(
