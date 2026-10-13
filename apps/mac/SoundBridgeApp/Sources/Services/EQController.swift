@@ -75,9 +75,10 @@ class EQController: ObservableObject {
 
     let deviceUID: String
 
-    /// Shared memory pointer — nil when device not connected.
-    private var sharedMemory: UnsafeMutablePointer<RFSharedAudio>?
-    private var shmSize: Int = 0
+    /// EQ control mapping (never the audio ring) — nil when the host has no session.
+    private var eqControl: UnsafeMutablePointer<RFEQControl>?
+    /// Kept open to detect that the host replaced the file (link count drops to 0).
+    private var eqFileDescriptor: Int32 = -1
 
     // MARK: - Published State (UI 60Hz responsive)
 
@@ -114,9 +115,8 @@ class EQController: ObservableObject {
 
     // MARK: - Init
 
-    init(deviceUID: String, sharedMemory: UnsafeMutablePointer<RFSharedAudio>? = nil) {
+    init(deviceUID: String) {
         self.deviceUID = deviceUID
-        self.sharedMemory = sharedMemory
         setupThrottledPipeline()
         loadFromUserDefaults()
     }
@@ -125,7 +125,10 @@ class EQController: ObservableObject {
     /// Use only in unit/property tests where Combine infrastructure is not needed.
     init(testDeviceUID: String) {
         self.deviceUID = testDeviceUID
-        self.sharedMemory = nil
+    }
+
+    deinit {
+        detachSharedMemory()
     }
 
     // MARK: - Gain Clamping (Sub-task 1.4)
@@ -336,76 +339,68 @@ class EQController: ObservableObject {
 
     // MARK: - Shared Memory Attachment
 
-    /// Attach to the Host's shared memory file for a given device UID.
-    /// The Host creates `/tmp/soundbridge-{sanitized_uid}` via mmap.
-    /// The App opens the same file read-write to write EQ snapshots.
+    private var attachedDeviceUID: String?
+
+    /// Attach to the host's EQ control file for `deviceUID` inside the validated
+    /// per-user session directory. Only the 128-byte EQ control block is mapped;
+    /// the app has no access to audio samples or ring geometry.
     func attachSharedMemory(for deviceUID: String) {
-        // Detach previous mapping if any
         detachSharedMemory()
+        attachedDeviceUID = deviceUID
 
-        let safeUID = deviceUID
-            .replacingOccurrences(of: ":", with: "_")
-            .replacingOccurrences(of: "/", with: "_")
-            .replacingOccurrences(of: " ", with: "_")
-        let shmPath = "/tmp/soundbridge-\(safeUID)"
-
-        guard FileManager.default.fileExists(atPath: shmPath) else {
-            logger.warning("Shared memory file not found: \(shmPath, privacy: .public)")
+        guard let dir = AppSessionIPC.openDirectory() else {
+            logger.warning("SoundBridge session not available; EQ not attached")
             return
         }
+        defer { close(dir) }
+        guard let name = AppSessionIPC.fileName(prefix: RF_IPC_EQ_PREFIX, deviceUID: deviceUID) else { return }
 
-        let fd = open(shmPath, O_RDWR)
+        let size = Int(RF_EQ_CONTROL_SIZE)
+        let fd = rf_ipc_open_file(dir, name, O_RDWR, geteuid(), off_t(size), off_t(size), nil)
         guard fd >= 0 else {
-            logger.error("Failed to open shared memory: \(String(cString: strerror(errno)), privacy: .public)")
+            logger.warning("EQ control not available: \(String(cString: strerror(errno)), privacy: .public)")
             return
         }
-
-        // Get file size to determine mmap length
-        var stat = stat()
-        guard fstat(fd, &stat) == 0 else {
-            logger.error("fstat failed: \(String(cString: strerror(errno)), privacy: .public)")
-            close(fd)
-            return
-        }
-
-        let fileSize = Int(stat.st_size)
-        guard fileSize >= MemoryLayout<RFSharedAudio>.size else {
-            logger.error("Shared memory file too small: \(fileSize) bytes")
-            close(fd)
-            return
-        }
-
-        let mem = mmap(nil, fileSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)
-        close(fd)
-
-        guard mem != MAP_FAILED, let validMem = mem else {
+        guard let base = mmap(nil, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0), base != MAP_FAILED else {
             logger.error("mmap failed: \(String(cString: strerror(errno)), privacy: .public)")
+            close(fd)
+            return
+        }
+        let control = base.assumingMemoryBound(to: RFEQControl.self)
+        let hash = AppSessionIPC.uidHash(deviceUID)
+        guard rf_eq_control_validate(control, size, hash) else {
+            logger.error("EQ control failed validation")
+            munmap(base, size)
+            close(fd)
             return
         }
 
-        sharedMemory = validMem.assumingMemoryBound(to: RFSharedAudio.self)
-        shmSize = fileSize
-        logger.info("EQ attached to shared memory: \(shmPath, privacy: .public) (\(fileSize) bytes)")
-
-        // Immediately flush current EQ state to shared memory
+        eqControl = control
+        eqFileDescriptor = fd
         flushToSharedMemory()
     }
 
-    /// Detach from shared memory (unmap).
     func detachSharedMemory() {
-        guard let mem = sharedMemory else { return }
-        if shmSize > 0 {
-            munmap(mem, shmSize)
+        if let control = eqControl {
+            munmap(control, Int(RF_EQ_CONTROL_SIZE))
         }
-        sharedMemory = nil
-        shmSize = 0
+        if eqFileDescriptor >= 0 {
+            close(eqFileDescriptor)
+        }
+        eqControl = nil
+        eqFileDescriptor = -1
     }
 
     // MARK: - Shared Memory Write (Phase 2)
 
-    /// Write current EQ state to shared memory via RFEQSnapshot.
     private func writeToSharedMemory(bandGains: [Float], preamp: Float, bypass: Bool) {
-        guard let mem = sharedMemory else { return }
+        // The host atomically replaces the file on device reconnect; follow it.
+        var st = stat()
+        if eqFileDescriptor >= 0, fstat(eqFileDescriptor, &st) == 0, st.st_nlink == 0, let uid = attachedDeviceUID {
+            attachSharedMemory(for: uid)
+            return // attach flushes current state
+        }
+        guard let control = eqControl else { return }
 
         var snapshot = RFEQSnapshot()
         withUnsafeMutablePointer(to: &snapshot.bands) { ptr in
@@ -416,15 +411,16 @@ class EQController: ObservableObject {
             }
         }
         snapshot.preamp = preamp
-        snapshot.bypass = bypass
+        snapshot.bypass = bypass ? 1 : 0
 
-        rf_store_eq_snapshot(mem, &snapshot)
+        if !rf_eq_store(control, &snapshot) {
+            logger.error("Rejected non-finite EQ snapshot")
+        }
     }
 
     // MARK: - Flush to Shared Memory (Sub-task 1.9)
 
     /// Immediately sync current state to shared memory, bypassing throttle and change detection.
-    /// Phase 1: no-op. Phase 2: will compute and write via SeqLock.
     func flushToSharedMemory() {
         let bandGains = EQController.computeBandGains(bass: bass, mids: mids, treble: treble)
         let preamp = EQController.computeAutoGainCompensation(bass: bass, mids: mids, treble: treble)

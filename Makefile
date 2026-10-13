@@ -1,7 +1,7 @@
 # SoundBridge Development Makefile
 # Shortcuts for building, testing, and running SoundBridge
 
-.PHONY: help clean build run dev reset bundle install-deps test sign verify release test-release quick rebuild dmg full-release changelog update-version
+.PHONY: help clean build run dev reset bundle release-bundle install-deps test test-native test-host test-app test-all check-protocol sign verify release test-release quick rebuild dmg full-release changelog update-version
 
 # Default target - show help
 help:
@@ -33,6 +33,7 @@ help:
 	@echo ""
 	@echo "  Other:"
 	@echo "    make test         - Run DSP tests"
+	@echo "    make test-all     - Protocol sync + native sanitizer harness + DSP + host + app tests"
 	@echo "    make install-deps - Install build dependencies"
 	@echo "    make changelog    - Update CHANGELOG.md (optional: VERSION=vX.Y.Z)"
 	@echo ""
@@ -102,12 +103,31 @@ install-deps:
 # Run DSP tests
 test:
 	@echo "Running DSP tests..."
-	@cd packages/dsp && \
-	mkdir -p build && \
-	cd build && \
-	cmake .. && \
-	cmake --build . && \
-	./soundbridge_dsp_tests
+	@cmake -S packages/dsp -B packages/dsp/build -DCMAKE_BUILD_TYPE=Release
+	@cmake --build packages/dsp/build
+	@./packages/dsp/build/tests/soundbridge_dsp_tests
+
+check-protocol:
+	@./tools/check_protocol_sync.sh
+
+# Protocol, IPC validation and stream conversion under ASan+UBSan, then TSan
+test-native:
+	@cmake -S packages/driver/tests -B packages/driver/tests/build-asan -DCMAKE_BUILD_TYPE=Debug
+	@cmake --build packages/driver/tests/build-asan
+	@./packages/driver/tests/build-asan/soundbridge_protocol_tests
+	@cmake -S packages/driver/tests -B packages/driver/tests/build-tsan -DCMAKE_BUILD_TYPE=Debug -DSB_SANITIZE=thread
+	@cmake --build packages/driver/tests/build-tsan
+	@./packages/driver/tests/build-tsan/soundbridge_protocol_tests
+
+# Host links libsoundbridge_dsp.a, so DSP is built first (by `test`)
+test-host: test
+	@cd packages/host && swift test
+
+test-app:
+	@cd apps/mac/SoundBridgeApp && swift test --force-resolved-versions
+
+test-all: check-protocol test-native test-host test-app
+	@echo "✓ All test suites passed"
 
 # Quick rebuild (for when you only changed Swift code)
 quick:
@@ -130,8 +150,12 @@ verify:
 	@echo "Verifying signatures..."
 	@./tools/verify_signatures.sh
 
-# Build and sign (for release)
-release: build bundle sign verify
+# Release bundles must carry the driver, Sparkle, and a configured update feed.
+release-bundle:
+	@REQUIRE_RELEASE_COMPONENTS=1 ./tools/create_app_bundle.sh
+
+# Build and sign (for release). Requires SPARKLE_FEED_URL and SPARKLE_PUBLIC_ED_KEY.
+release: build release-bundle sign verify
 	@echo ""
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 	@echo "     Release Build Complete!"
@@ -156,7 +180,7 @@ dmg:
 	@./tools/create_dmg.sh
 
 # Full release pipeline (build, sign, create DMG)
-full-release: build bundle sign verify dmg
+full-release: build release-bundle sign verify dmg
 	@echo ""
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 	@echo "  Full Release Build Complete!"

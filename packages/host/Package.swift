@@ -33,5 +33,10 @@ let package = Package(
                 .unsafeFlags(["-lc++"]),
             ]
         ),
+        .testTarget(
+            name: "SoundBridgeHostTests",
+            dependencies: ["SoundBridgeHost", "CSoundBridgeAudio"],
+            path: "Tests/SoundBridgeHostTests"
+        ),
     ]
 )

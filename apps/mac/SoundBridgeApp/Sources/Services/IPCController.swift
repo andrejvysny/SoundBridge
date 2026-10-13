@@ -35,7 +35,8 @@ class IPCController {
     static let shared = IPCController()
 
     private let fileURL: URL
-    private var fileDescriptor: Int32 = -1
+    /// Upper bound for device-state.json; larger files are ignored.
+    private let maxStateFileSize = 1 << 20
     private var dispatchSource: DispatchSourceFileSystemObject?
     private var darwinNotifyToken: Int32 = 0
     private var darwinNotifyRegistered = false
@@ -47,11 +48,11 @@ class IPCController {
             in: .userDomainMask
         ).first!.appendingPathComponent("SoundBridge")
 
-        // Ensure directory exists
+        // Ensure directory exists (owner-only, like the host creates it)
         try? FileManager.default.createDirectory(
             at: appSupport,
             withIntermediateDirectories: true,
-            attributes: nil
+            attributes: [.posixPermissions: 0o700]
         )
 
         self.fileURL = appSupport.appendingPathComponent("device-state.json")
@@ -90,14 +91,14 @@ class IPCController {
             FileManager.default.createFile(atPath: fileURL.path, contents: nil)
         }
 
-        fileDescriptor = open(fileURL.path, O_EVTONLY)
-        guard fileDescriptor >= 0 else {
+        let descriptor = open(fileURL.path, O_EVTONLY | O_NOFOLLOW)
+        guard descriptor >= 0 else {
             print("[IPCController] Failed to open file for monitoring: \(fileURL.path)")
             return
         }
 
         let source = DispatchSource.makeFileSystemObjectSource(
-            fileDescriptor: fileDescriptor,
+            fileDescriptor: descriptor,
             eventMask: [.write, .rename, .delete],
             queue: DispatchQueue.global(qos: .utility)
         )
@@ -120,12 +121,10 @@ class IPCController {
             }
         }
 
-        source.setCancelHandler { [weak self] in
-            guard let self else { return }
-            if self.fileDescriptor >= 0 {
-                close(self.fileDescriptor)
-                self.fileDescriptor = -1
-            }
+        // Close exactly the descriptor this source watched; by the time the
+        // handler runs a restarted monitor may already own a new one.
+        source.setCancelHandler {
+            close(descriptor)
         }
 
         dispatchSource = source
@@ -147,9 +146,11 @@ class IPCController {
 
     /// Read and decode the current device state from disk.
     func readDeviceState() -> IPCDeviceState? {
-        guard FileManager.default.fileExists(atPath: fileURL.path),
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
+              attributes[.type] as? FileAttributeType == .typeRegular,
+              let size = attributes[.size] as? Int, size > 0, size <= maxStateFileSize,
               let data = try? Data(contentsOf: fileURL),
-              !data.isEmpty else {
+              data.count <= maxStateFileSize else {
             return nil
         }
 

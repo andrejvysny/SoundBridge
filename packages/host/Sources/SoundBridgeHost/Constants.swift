@@ -2,7 +2,7 @@ import Foundation
 import CSoundBridgeAudio
 
 struct SoundBridgeConfig {
-    /// 采样率的线程安全访问
+    /// Thread-safe access to the active sample rate
     private static var _activeSampleRate: UInt32 = 48000
     private static var sampleRateLock = os_unfair_lock()
 
@@ -21,12 +21,7 @@ struct SoundBridgeConfig {
     /// Fallback sample rate if device query fails
     static let defaultSampleRate: UInt32 = 48000
     static let defaultChannels: UInt32 = 2
-    static let defaultFormat = RF_FORMAT_FLOAT32
     static let defaultDurationMs: UInt32 = 100
-
-    static var controlFilePath: String {
-        return PathManager.controlFilePath
-    }
 
     static let heartbeatInterval: TimeInterval = 1.0
     static let wakeRecoveryDelay: TimeInterval = 1.5
@@ -35,5 +30,7 @@ struct SoundBridgeConfig {
 
     static let deviceWaitTimeout: TimeInterval = 2.0
     static let cleanupWaitTimeout: TimeInterval = 1.2
+    /// Minimum spacing between reconnect bounces, whatever triggers them.
+    static let bounceMinInterval: TimeInterval = 2.0
     static let physicalDeviceSwitchDelay: TimeInterval = 0.5
 }

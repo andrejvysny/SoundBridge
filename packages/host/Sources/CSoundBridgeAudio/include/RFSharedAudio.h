@@ -1,218 +1,143 @@
 #ifndef RF_SHARED_AUDIO_H
 #define RF_SHARED_AUDIO_H
 
-#include <stdint.h>
-#include <stdatomic.h>
+/*
+ * SoundBridge shared-memory protocol (driver <-> host audio, app -> host EQ).
+ *
+ * Identical copies live in:
+ *   packages/driver/include/
+ *   packages/host/Sources/CSoundBridgeAudio/include/
+ *   apps/mac/SoundBridgeApp/Sources/CSoundBridgeAudio/include/
+ * `tools/check_protocol_sync.sh` enforces this.
+ *
+ * Trust model: every byte of a mapping is writable by the peer, so header
+ * geometry is validated once into a local RFAudioLayout and never re-read.
+ * Ring indices are re-read on every call and bounds-checked against that
+ * local layout. Each index has exactly one writer (producer: write_index,
+ * consumer: read_index).
+ */
+
+#include <math.h>
 #include <stdbool.h>
-#include <time.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <string.h>
+#include <time.h>
 
 #ifdef __cplusplus
 extern "C" {
+#define RF_STATIC_ASSERT(cond, msg) static_assert(cond, msg)
+#else
+#define RF_STATIC_ASSERT(cond, msg) _Static_assert(cond, msg)
 #endif
 
-// Protocol version
-#define RF_AUDIO_PROTOCOL_VERSION 0x00020000
+// <stdatomic.h> is deliberately not used: its function-like macros (atomic_load, ...)
+// collide with libc++ <atomic>/<memory> before C++23. The clang builtins below
+// are what those macros expand to, and work in both C and C++.
+#define RF_ATOMIC_LOAD(obj) __c11_atomic_load(obj, __ATOMIC_SEQ_CST)
+#define RF_ATOMIC_STORE(obj, value) __c11_atomic_store(obj, value, __ATOMIC_SEQ_CST)
+#define RF_ATOMIC_ADD(obj, value) __c11_atomic_fetch_add(obj, value, __ATOMIC_SEQ_CST)
 
-// Audio format types
-typedef enum {
-    RF_FORMAT_FLOAT32 = 0,
-    RF_FORMAT_FLOAT64 = 1,
-    RF_FORMAT_INT16 = 2,
-    RF_FORMAT_INT24 = 3,
-    RF_FORMAT_INT32 = 4
-} RFAudioFormat;
+// ===== AUDIO TRANSPORT CONSTANTS =====
 
-// Supported nominal sample rates.
-static const uint32_t RF_SUPPORTED_SAMPLE_RATES[] = {
-    44100,   // 44.1 kHz
-    48000,   // 48 kHz
-    88200,   // 88.2 kHz
-    96000,   // 96 kHz
-    176400,  // 176.4 kHz
-    192000   // 192 kHz
-};
+#define RF_AUDIO_MAGIC 0x55414253u /* "SBAU" */
+#define RF_AUDIO_PROTOCOL_VERSION 0x00030000u
+#define RF_AUDIO_HEADER_SIZE 256u
+
+// The transport is fixed to interleaved stereo float32. The DSP engine is
+// stereo-only, so wider layouts are rejected rather than half-supported.
+typedef enum { RF_FORMAT_FLOAT32 = 0 } RFAudioFormat;
+
+#define RF_TRANSPORT_CHANNELS 2u
+#define RF_TRANSPORT_BYTES_PER_SAMPLE 4u
+#define RF_TRANSPORT_BYTES_PER_FRAME 8u
+
+static const uint32_t RF_SUPPORTED_SAMPLE_RATES[] = {44100, 48000, 88200, 96000, 176400, 192000};
 #define RF_NUM_SAMPLE_RATES 6
+#define RF_MAX_SAMPLE_RATE 192000u
 
-// Channel configuration
-#define RF_MAX_CHANNELS 8  // Up to 7.1 channel layouts
+#define RF_RING_DURATION_MS_MIN 20u
+#define RF_RING_DURATION_MS_MAX 100u
+#define RF_RING_DURATION_MS_DEFAULT 100u
+#define RF_RING_CAPACITY_MAX_FRAMES 19200u /* RF_MAX_SAMPLE_RATE * RF_RING_DURATION_MS_MAX / 1000 */
 
-// Ring buffer duration limits (sample-rate independent).
-#define RF_RING_DURATION_MS_MIN 20
-#define RF_RING_DURATION_MS_MAX 100
-#define RF_RING_DURATION_MS_DEFAULT 100
+#define RF_UID_HASH_SIZE 32u
 
-// Calculate frames for given sample rate and duration
-static inline uint32_t rf_frames_for_duration(uint32_t sample_rate, uint32_t duration_ms) {
-    return (sample_rate * duration_ms) / 1000;
-}
+// Largest valid volume scalar; anything else is treated as silence.
+#define RF_VOLUME_MAX 1.0f
 
-/**
- * EQ snapshot for cross-process communication.
- * Written by App (30Hz), read by Host in render loop.
- * Simple memcpy — no locking needed at this frequency/size.
- */
 typedef struct {
-    float bands[10];    // 10-band gain values in dB
-    float preamp;       // Auto-gain compensation in dB
-    bool bypass;        // true = EQ bypassed
-    uint8_t _pad[3];   // Align to 48 bytes
-} RFEQSnapshot;
+    // ===== IMMUTABLE AFTER CREATION (validated once by readers) =====
+    uint32_t magic;                // RF_AUDIO_MAGIC
+    uint32_t protocol_version;     // RF_AUDIO_PROTOCOL_VERSION
+    uint32_t header_size;          // RF_AUDIO_HEADER_SIZE
+    uint32_t sample_rate;          // one of RF_SUPPORTED_SAMPLE_RATES
+    uint32_t channels;             // RF_TRANSPORT_CHANNELS
+    uint32_t format;               // RF_FORMAT_FLOAT32
+    uint32_t bytes_per_sample;     // RF_TRANSPORT_BYTES_PER_SAMPLE
+    uint32_t bytes_per_frame;      // RF_TRANSPORT_BYTES_PER_FRAME
+    uint32_t ring_capacity_frames; // rf_frames_for_duration(sample_rate,
+                                   // ring_duration_ms)
+    uint32_t ring_duration_ms;     // [RF_RING_DURATION_MS_MIN, RF_RING_DURATION_MS_MAX]
+    uint64_t creation_timestamp;   // Unix seconds, informational only
+    uint8_t device_uid_hash[32];   // SHA-256 of the physical device UID
 
-/**
- * Shared memory protocol header plus flexible audio payload.
- */
-typedef struct {
-    // ===== PROTOCOL INFO =====
-    uint32_t protocol_version;        // RF_AUDIO_PROTOCOL_VERSION
-    uint32_t header_size;             // Size of this header (for future expansion)
-
-    // ===== AUDIO FORMAT (negotiated) =====
-    uint32_t sample_rate;             // Current sample rate (44100-192000)
-    uint32_t channels;                // Current channel count (1-8)
-    uint32_t format;                  // RFAudioFormat enum value
-    uint32_t bytes_per_sample;        // Bytes per single sample (4 for float32, etc.)
-    uint32_t bytes_per_frame;         // bytes_per_sample * channels
-
-    // ===== RING BUFFER CONFIG =====
-    uint32_t ring_capacity_frames;    // Total frames in ring buffer
-    uint32_t ring_duration_ms;        // Duration in milliseconds
-
-    // ===== CAPABILITY FLAGS =====
-    uint32_t driver_capabilities;     // Bit flags for driver features
-    uint32_t host_capabilities;       // Bit flags for host features
-
-    // ===== TIMING & SYNC =====
-    uint64_t creation_timestamp;      // Unix timestamp
-    _Atomic uint64_t format_change_counter;  // Increments on format change
-
-    // ===== ATOMIC INDICES =====
-    _Atomic uint64_t write_index;     // Producer write position (frames)
-    _Atomic uint64_t read_index;      // Consumer read position (frames)
+    // ===== RING INDICES (single writer each) =====
+    _Atomic uint64_t write_index; // written only by the producer (driver)
+    _Atomic uint64_t read_index;  // written only by the consumer (host)
 
     // ===== STATISTICS =====
     _Atomic uint64_t total_frames_written;
     _Atomic uint64_t total_frames_read;
     _Atomic uint64_t overrun_count;
     _Atomic uint64_t underrun_count;
-    _Atomic uint64_t format_mismatch_count;  // Format negotiation failures
 
-    // ===== STATUS FLAGS =====
-    _Atomic uint32_t driver_connected;   // 1 if driver is connected
-    _Atomic uint32_t host_connected;     // 1 if host is connected
-    _Atomic uint64_t driver_heartbeat;   // Incremented by driver write callbacks
-    _Atomic uint64_t host_heartbeat;     // Incremented by host heartbeat timer
+    // ===== STATUS =====
+    _Atomic uint32_t driver_connected;
+    _Atomic uint32_t host_connected;
+    _Atomic uint64_t driver_heartbeat;
+    _Atomic uint64_t host_heartbeat;
 
-    // ===== VOLUME CONTROL =====
-    _Atomic float   volume_scalar;       // 0.0 - 1.0, default 0.35
-    _Atomic int32_t mute_state;          // 0 = unmuted, 1 = muted
+    // ===== VOLUME CONTROL (driver writes, host validates) =====
+    _Atomic float volume_scalar;
+    _Atomic int32_t mute_state;
 
-    // ===== EQ CONTROL =====
-    _Atomic uint32_t eq_sequence;        // SeqLock: even = idle, odd = writing
-    RFEQSnapshot eq_snapshot;            // 48 bytes — written by App, read by Host
+    uint8_t _reserved[96];
 
-    // Reserved bytes for forward-compatible header growth.
-    uint8_t _reserved[256 - 148 - sizeof(RFEQSnapshot)];
-
-    // ===== RING BUFFER DATA =====
-    // Interleaved audio data in the negotiated format
-    // Size is: ring_capacity_frames * channels * bytes_per_sample
-    // This MUST be the last field (flexible array member)
+    // Interleaved float32 stereo, ring_capacity_frames frames.
     uint8_t audio_data[];
-
 } RFSharedAudio;
 
-// Capability flags
-#define RF_CAP_MULTI_SAMPLE_RATE    (1 << 0)  // Supports multiple sample rates
-#define RF_CAP_MULTI_FORMAT         (1 << 1)  // Supports multiple formats
-#define RF_CAP_MULTI_CHANNEL        (1 << 2)  // Supports multiple channel counts
-#define RF_CAP_SAMPLE_RATE_CONVERT  (1 << 3)  // Has sample rate converter
-#define RF_CAP_FORMAT_CONVERT       (1 << 4)  // Has format converter
-#define RF_CAP_AUTO_RECONNECT       (1 << 5)  // Supports auto-reconnect
-#define RF_CAP_HEARTBEAT_MONITOR    (1 << 6)  // Monitors connection health
+RF_STATIC_ASSERT(sizeof(RFSharedAudio) == RF_AUDIO_HEADER_SIZE, "RFSharedAudio header must be 256 bytes");
+RF_STATIC_ASSERT(offsetof(RFSharedAudio, write_index) == 80, "RFSharedAudio layout drift");
+RF_STATIC_ASSERT(offsetof(RFSharedAudio, volume_scalar) == 152, "RFSharedAudio layout drift");
+RF_STATIC_ASSERT(offsetof(RFSharedAudio, audio_data) == RF_AUDIO_HEADER_SIZE, "RFSharedAudio layout drift");
 
-/**
- * Calculate total size needed for shared memory
- */
-static inline size_t rf_shared_audio_size(uint32_t capacity_frames,
-                                              uint32_t channels,
-                                              uint32_t bytes_per_sample) {
-    return sizeof(RFSharedAudio) + (capacity_frames * channels * bytes_per_sample);
-}
+/** Locally owned copy of validated geometry. Never read geometry from shared
+ * memory again. */
+typedef struct {
+    uint32_t sample_rate;
+    uint32_t channels;
+    uint32_t capacity_frames;
+    uint32_t bytes_per_frame;
+    size_t mapping_length;
+} RFAudioLayout;
 
-/**
- * Initialize shared memory with format specification
- */
-static inline void rf_shared_audio_init(
-    RFSharedAudio* mem,
-    uint32_t sample_rate,
-    uint32_t channels,
-    RFAudioFormat format,
-    uint32_t duration_ms)
-{
-    memset(mem, 0, sizeof(RFSharedAudio));
-    // Note: memset zeroes eq_snapshot (bands=0, preamp=0, bypass=false)
+typedef enum {
+    RF_LAYOUT_OK = 0,
+    RF_LAYOUT_ERR_NULL,
+    RF_LAYOUT_ERR_TOO_SMALL,
+    RF_LAYOUT_ERR_MAGIC,
+    RF_LAYOUT_ERR_VERSION,
+    RF_LAYOUT_ERR_HEADER_SIZE,
+    RF_LAYOUT_ERR_SAMPLE_RATE,
+    RF_LAYOUT_ERR_FORMAT,
+    RF_LAYOUT_ERR_DURATION,
+    RF_LAYOUT_ERR_CAPACITY,
+    RF_LAYOUT_ERR_SIZE_MISMATCH,
+    RF_LAYOUT_ERR_DEVICE
+} RFLayoutStatus;
 
-    mem->protocol_version = RF_AUDIO_PROTOCOL_VERSION;
-    mem->header_size = sizeof(RFSharedAudio);
-
-    // Audio format
-    mem->sample_rate = sample_rate;
-    mem->channels = channels;
-    mem->format = format;
-
-    // Calculate bytes per sample based on format
-    switch (format) {
-        case RF_FORMAT_FLOAT32: mem->bytes_per_sample = 4; break;
-        case RF_FORMAT_FLOAT64: mem->bytes_per_sample = 8; break;
-        case RF_FORMAT_INT16:   mem->bytes_per_sample = 2; break;
-        case RF_FORMAT_INT24:   mem->bytes_per_sample = 3; break;
-        case RF_FORMAT_INT32:   mem->bytes_per_sample = 4; break;
-        default:                mem->bytes_per_sample = 4; break;
-    }
-
-    mem->bytes_per_frame = mem->bytes_per_sample * channels;
-
-    // Ring buffer sizing
-    mem->ring_capacity_frames = rf_frames_for_duration(sample_rate, duration_ms);
-    mem->ring_duration_ms = duration_ms;
-
-    // Capabilities - driver advertises what it supports
-    mem->driver_capabilities =
-        RF_CAP_MULTI_SAMPLE_RATE |
-        RF_CAP_MULTI_FORMAT |
-        RF_CAP_MULTI_CHANNEL |
-        RF_CAP_FORMAT_CONVERT |
-        RF_CAP_AUTO_RECONNECT |
-        RF_CAP_HEARTBEAT_MONITOR;
-
-    mem->creation_timestamp = (uint64_t)time(NULL);
-
-    // Initialize atomics
-    atomic_store(&mem->format_change_counter, 0);
-    atomic_store(&mem->write_index, 0);
-    atomic_store(&mem->read_index, 0);
-    atomic_store(&mem->total_frames_written, 0);
-    atomic_store(&mem->total_frames_read, 0);
-    atomic_store(&mem->overrun_count, 0);
-    atomic_store(&mem->underrun_count, 0);
-    atomic_store(&mem->format_mismatch_count, 0);
-    atomic_store(&mem->driver_connected, 0);
-    atomic_store(&mem->host_connected, 1);  // Host creates the memory
-    atomic_store(&mem->driver_heartbeat, 0);
-    atomic_store(&mem->host_heartbeat, 0);
-
-    // Volume control defaults
-    atomic_init(&mem->volume_scalar, 0.35f);
-    atomic_init(&mem->mute_state, 0);
-
-    // EQ SeqLock
-    atomic_init(&mem->eq_sequence, 0);
-}
-
-/**
- * Check if sample rate is supported
- */
 static inline bool rf_is_sample_rate_supported(uint32_t sample_rate) {
     for (int i = 0; i < RF_NUM_SAMPLE_RATES; i++) {
         if (RF_SUPPORTED_SAMPLE_RATES[i] == sample_rate) {
@@ -222,304 +147,432 @@ static inline bool rf_is_sample_rate_supported(uint32_t sample_rate) {
     return false;
 }
 
-/**
- * Get bytes per sample for a format
- */
+static inline uint32_t rf_frames_for_duration(uint32_t sample_rate, uint32_t duration_ms) {
+    return (uint32_t)(((uint64_t)sample_rate * (uint64_t)duration_ms) / 1000u);
+}
+
 static inline uint32_t rf_bytes_per_sample(RFAudioFormat format) {
-    switch (format) {
-        case RF_FORMAT_FLOAT32: return 4;
-        case RF_FORMAT_FLOAT64: return 8;
-        case RF_FORMAT_INT16:   return 2;
-        case RF_FORMAT_INT24:   return 3;
-        case RF_FORMAT_INT32:   return 4;
-        default:                return 4;
+    return format == RF_FORMAT_FLOAT32 ? RF_TRANSPORT_BYTES_PER_SAMPLE : 0u;
+}
+
+/** Total mapping size for a ring, or 0 when capacity is out of range. */
+static inline size_t rf_shared_audio_size(uint32_t capacity_frames) {
+    if (capacity_frames == 0 || capacity_frames > RF_RING_CAPACITY_MAX_FRAMES) {
+        return 0;
     }
+    return (size_t)RF_AUDIO_HEADER_SIZE + (size_t)capacity_frames * (size_t)RF_TRANSPORT_BYTES_PER_FRAME;
+}
+
+static inline size_t rf_shared_audio_max_size(void) {
+    return rf_shared_audio_size(RF_RING_CAPACITY_MAX_FRAMES);
 }
 
 /**
- * Check if both sides are connected and healthy
+ * Initialize a freshly created mapping. Returns false (and writes nothing)
+ * if parameters are invalid or mapped_length does not match exactly.
  */
-static inline bool rf_is_connection_healthy(const RFSharedAudio* mem) {
-    uint32_t driver_conn = atomic_load(&mem->driver_connected);
-    uint32_t host_conn = atomic_load(&mem->host_connected);
+static inline bool rf_shared_audio_init(RFSharedAudio* mem, size_t mapped_length, uint32_t sample_rate,
+                                        uint32_t duration_ms, const uint8_t* device_uid_hash) {
+    if (!mem || !device_uid_hash) return false;
+    if (!rf_is_sample_rate_supported(sample_rate)) return false;
+    if (duration_ms < RF_RING_DURATION_MS_MIN || duration_ms > RF_RING_DURATION_MS_MAX) return false;
+    uint32_t capacity = rf_frames_for_duration(sample_rate, duration_ms);
+    size_t expected = rf_shared_audio_size(capacity);
+    if (expected == 0 || expected != mapped_length) return false;
 
-    if (driver_conn == 0 || host_conn == 0) {
-        return false;
-    }
+    memset(mem, 0, mapped_length);
+    mem->magic = RF_AUDIO_MAGIC;
+    mem->protocol_version = RF_AUDIO_PROTOCOL_VERSION;
+    mem->header_size = RF_AUDIO_HEADER_SIZE;
+    mem->sample_rate = sample_rate;
+    mem->channels = RF_TRANSPORT_CHANNELS;
+    mem->format = RF_FORMAT_FLOAT32;
+    mem->bytes_per_sample = RF_TRANSPORT_BYTES_PER_SAMPLE;
+    mem->bytes_per_frame = RF_TRANSPORT_BYTES_PER_FRAME;
+    mem->ring_capacity_frames = capacity;
+    mem->ring_duration_ms = duration_ms;
+    mem->creation_timestamp = (uint64_t)time(NULL);
+    memcpy(mem->device_uid_hash, device_uid_hash, RF_UID_HASH_SIZE);
 
-    // Check heartbeats (should be incrementing)
-    uint64_t driver_hb = atomic_load(&mem->driver_heartbeat);
-    uint64_t host_hb = atomic_load(&mem->host_heartbeat);
-
-    // Both should be non-zero if connection is established
-    return (driver_hb > 0 && host_hb > 0);
+    RF_ATOMIC_STORE(&mem->write_index, 0);
+    RF_ATOMIC_STORE(&mem->read_index, 0);
+    RF_ATOMIC_STORE(&mem->host_connected, 1);
+    RF_ATOMIC_STORE(&mem->volume_scalar,
+                    0.0f); // silent until the driver publishes real volume
+    RF_ATOMIC_STORE(&mem->mute_state, 0);
+    return true;
 }
 
 /**
- * Write frames to ring buffer with automatic format conversion
- *
- * This version accepts float32 input and converts to the ring buffer's format
+ * Validate a mapping and capture its geometry locally.
+ * Every header field is read exactly once so concurrent peer writes cannot
+ * make the checked value differ from the used value.
+ * expected_uid_hash may be NULL to skip the device binding check.
  */
-static inline uint32_t rf_ring_write(
-    RFSharedAudio* mem,
-    const float* input_frames,  // Always float32 input
-    uint32_t num_frames)
-{
-    uint64_t write_idx = atomic_load(&mem->write_index);
-    uint64_t read_idx = atomic_load(&mem->read_index);
-    uint32_t capacity = mem->ring_capacity_frames;
+static inline RFLayoutStatus rf_validate_layout(const RFSharedAudio* mem, size_t mapped_length,
+                                                const uint8_t* expected_uid_hash, RFAudioLayout* out) {
+    if (!mem || !out) return RF_LAYOUT_ERR_NULL;
+    if (mapped_length < RF_AUDIO_HEADER_SIZE) return RF_LAYOUT_ERR_TOO_SMALL;
 
-    // Check for overflow - advance read_index to keep producer timeline intact
-    uint64_t used = write_idx - read_idx;
-    if (used + num_frames > capacity) {
-        uint32_t frames_to_drop = (uint32_t)((used + num_frames) - capacity);
-        atomic_store(&mem->read_index, read_idx + frames_to_drop);
-        atomic_fetch_add(&mem->overrun_count, 1);
+    const uint32_t magic = mem->magic;
+    const uint32_t version = mem->protocol_version;
+    const uint32_t header_size = mem->header_size;
+    const uint32_t sample_rate = mem->sample_rate;
+    const uint32_t channels = mem->channels;
+    const uint32_t format = mem->format;
+    const uint32_t bytes_per_sample = mem->bytes_per_sample;
+    const uint32_t bytes_per_frame = mem->bytes_per_frame;
+    const uint32_t capacity = mem->ring_capacity_frames;
+    const uint32_t duration_ms = mem->ring_duration_ms;
+    uint8_t uid_hash[RF_UID_HASH_SIZE];
+    memcpy(uid_hash, mem->device_uid_hash, RF_UID_HASH_SIZE);
+
+    if (magic != RF_AUDIO_MAGIC) return RF_LAYOUT_ERR_MAGIC;
+    if (version != RF_AUDIO_PROTOCOL_VERSION) return RF_LAYOUT_ERR_VERSION;
+    if (header_size != RF_AUDIO_HEADER_SIZE) return RF_LAYOUT_ERR_HEADER_SIZE;
+    if (!rf_is_sample_rate_supported(sample_rate)) return RF_LAYOUT_ERR_SAMPLE_RATE;
+    if (channels != RF_TRANSPORT_CHANNELS || format != RF_FORMAT_FLOAT32 ||
+        bytes_per_sample != RF_TRANSPORT_BYTES_PER_SAMPLE || bytes_per_frame != RF_TRANSPORT_BYTES_PER_FRAME) {
+        return RF_LAYOUT_ERR_FORMAT;
+    }
+    if (duration_ms < RF_RING_DURATION_MS_MIN || duration_ms > RF_RING_DURATION_MS_MAX) {
+        return RF_LAYOUT_ERR_DURATION;
+    }
+    if (capacity != rf_frames_for_duration(sample_rate, duration_ms)) return RF_LAYOUT_ERR_CAPACITY;
+    const size_t expected = rf_shared_audio_size(capacity);
+    if (expected == 0) return RF_LAYOUT_ERR_CAPACITY;
+    if (expected != mapped_length) return RF_LAYOUT_ERR_SIZE_MISMATCH;
+    if (expected_uid_hash && memcmp(uid_hash, expected_uid_hash, RF_UID_HASH_SIZE) != 0) {
+        return RF_LAYOUT_ERR_DEVICE;
     }
 
-    // Write with format conversion
-    for (uint32_t frame = 0; frame < num_frames; frame++) {
-        uint32_t ring_pos = (uint32_t)((write_idx + frame) % capacity);
-        uint8_t* dest = &mem->audio_data[ring_pos * mem->bytes_per_frame];
+    out->sample_rate = sample_rate;
+    out->channels = channels;
+    out->capacity_frames = capacity;
+    out->bytes_per_frame = bytes_per_frame;
+    out->mapping_length = mapped_length;
+    return RF_LAYOUT_OK;
+}
 
-        for (uint32_t ch = 0; ch < mem->channels; ch++) {
-            float sample = input_frames[frame * mem->channels + ch];
+static inline const char* rf_layout_status_string(RFLayoutStatus status) {
+    switch (status) {
+        case RF_LAYOUT_OK: return "ok";
+        case RF_LAYOUT_ERR_NULL: return "null";
+        case RF_LAYOUT_ERR_TOO_SMALL: return "mapping too small";
+        case RF_LAYOUT_ERR_MAGIC: return "bad magic";
+        case RF_LAYOUT_ERR_VERSION: return "protocol version mismatch";
+        case RF_LAYOUT_ERR_HEADER_SIZE: return "bad header size";
+        case RF_LAYOUT_ERR_SAMPLE_RATE: return "unsupported sample rate";
+        case RF_LAYOUT_ERR_FORMAT: return "unsupported format";
+        case RF_LAYOUT_ERR_DURATION: return "bad ring duration";
+        case RF_LAYOUT_ERR_CAPACITY: return "bad ring capacity";
+        case RF_LAYOUT_ERR_SIZE_MISMATCH: return "mapping size mismatch";
+        case RF_LAYOUT_ERR_DEVICE: return "device mismatch";
+    }
+    return "unknown";
+}
 
-            switch (mem->format) {
-                case RF_FORMAT_FLOAT32: {
-                    float* ptr = (float*)dest;
-                    ptr[ch] = sample;
-                    break;
-                }
-                case RF_FORMAT_FLOAT64: {
-                    double* ptr = (double*)dest;
-                    ptr[ch] = (double)sample;
-                    break;
-                }
-                case RF_FORMAT_INT16: {
-                    int16_t* ptr = (int16_t*)dest;
-                    // Clamp to [-1.0, 1.0] and scale to int16 range
-                    if (sample > 1.0f) sample = 1.0f;
-                    if (sample < -1.0f) sample = -1.0f;
-                    ptr[ch] = (int16_t)(sample * 32767.0f);
-                    break;
-                }
-                case RF_FORMAT_INT32: {
-                    int32_t* ptr = (int32_t*)dest;
-                    if (sample > 1.0f) sample = 1.0f;
-                    if (sample < -1.0f) sample = -1.0f;
-                    ptr[ch] = (int32_t)(sample * 2147483647.0f);
-                    break;
-                }
-                case RF_FORMAT_INT24: {
-                    // 24-bit packed (3 bytes)
-                    if (sample > 1.0f) sample = 1.0f;
-                    if (sample < -1.0f) sample = -1.0f;
-                    int32_t val24 = (int32_t)(sample * 8388607.0f);
-                    uint8_t* ptr = dest + (ch * 3);
-                    ptr[0] = (val24 >> 0) & 0xFF;
-                    ptr[1] = (val24 >> 8) & 0xFF;
-                    ptr[2] = (val24 >> 16) & 0xFF;
-                    break;
-                }
-            }
+static inline float* rf_audio_frames(RFSharedAudio* mem) {
+    return (float*)(void*)mem->audio_data;
+}
+
+/**
+ * Producer: append interleaved stereo samples. input_samples must be even.
+ * Frames that do not fit are dropped (the producer never moves read_index).
+ * Returns frames written.
+ */
+static inline uint32_t rf_ring_write(RFSharedAudio* mem, const RFAudioLayout* layout, const float* input,
+                                     size_t input_samples) {
+    if (!mem || !layout || !input || layout->capacity_frames == 0) return 0;
+    const uint64_t capacity = layout->capacity_frames;
+    const size_t channels = RF_TRANSPORT_CHANNELS;
+    uint64_t frames = (uint64_t)(input_samples / channels);
+    if (frames == 0) return 0;
+
+    uint64_t w = RF_ATOMIC_LOAD(&mem->write_index);
+    const uint64_t r = RF_ATOMIC_LOAD(&mem->read_index);
+    uint64_t used = w - r;
+    if (used > capacity) {
+        // Consumer ahead of producer or corrupted indices: resync our own index
+        // only.
+        w = r;
+        used = 0;
+        RF_ATOMIC_ADD(&mem->overrun_count, 1);
+    }
+
+    const uint64_t free_frames = capacity - used;
+    if (frames > free_frames) {
+        frames = free_frames;
+        RF_ATOMIC_ADD(&mem->overrun_count, 1);
+    }
+    if (frames > 0) {
+        float* data = rf_audio_frames(mem);
+        const uint64_t pos = w % capacity;
+        const uint64_t first = (frames < capacity - pos) ? frames : capacity - pos;
+        memcpy(data + pos * channels, input, (size_t)(first * channels) * sizeof(float));
+        if (frames > first) {
+            memcpy(data, input + first * channels, (size_t)((frames - first) * channels) * sizeof(float));
         }
     }
 
-    atomic_store(&mem->write_index, write_idx + num_frames);
-    atomic_fetch_add(&mem->total_frames_written, num_frames);
-
-    return num_frames;
+    RF_ATOMIC_STORE(&mem->write_index, w + frames);
+    RF_ATOMIC_ADD(&mem->total_frames_written, frames);
+    return (uint32_t)frames;
 }
 
 /**
- * Read frames from ring buffer with automatic format conversion
- *
- * This version outputs float32 regardless of ring buffer format
+ * Consumer: fill output (interleaved stereo, output_samples samples).
+ * Missing frames are zero-filled. Returns frames read from the ring.
  */
-static inline uint32_t rf_ring_read(
-    RFSharedAudio* mem,
-    float* output_frames,  // Always float32 output
-    uint32_t num_frames)
-{
-    uint64_t write_idx = atomic_load(&mem->write_index);
-    uint64_t read_idx = atomic_load(&mem->read_index);
-    uint32_t capacity = mem->ring_capacity_frames;
-    uint32_t available = (uint32_t)(write_idx - read_idx);
+static inline uint32_t rf_ring_read(RFSharedAudio* mem, const RFAudioLayout* layout, float* output,
+                                    size_t output_samples) {
+    if (!output) return 0;
+    const size_t channels = RF_TRANSPORT_CHANNELS;
+    const uint64_t wanted = (uint64_t)(output_samples / channels);
+    if (!mem || !layout || layout->capacity_frames == 0) {
+        memset(output, 0, output_samples * sizeof(float));
+        return 0;
+    }
+    const uint64_t capacity = layout->capacity_frames;
 
-    uint32_t frames_to_read = (available < num_frames) ? available : num_frames;
-
-    // Read with format conversion
-    for (uint32_t frame = 0; frame < frames_to_read; frame++) {
-        uint32_t ring_pos = (uint32_t)((read_idx + frame) % capacity);
-        const uint8_t* src = &mem->audio_data[ring_pos * mem->bytes_per_frame];
-
-        for (uint32_t ch = 0; ch < mem->channels; ch++) {
-            float sample = 0.0f;
-
-            switch (mem->format) {
-                case RF_FORMAT_FLOAT32: {
-                    const float* ptr = (const float*)src;
-                    sample = ptr[ch];
-                    break;
-                }
-                case RF_FORMAT_FLOAT64: {
-                    const double* ptr = (const double*)src;
-                    sample = (float)ptr[ch];
-                    break;
-                }
-                case RF_FORMAT_INT16: {
-                    const int16_t* ptr = (const int16_t*)src;
-                    sample = (float)ptr[ch] / 32768.0f;
-                    break;
-                }
-                case RF_FORMAT_INT32: {
-                    const int32_t* ptr = (const int32_t*)src;
-                    sample = (float)ptr[ch] / 2147483648.0f;
-                    break;
-                }
-                case RF_FORMAT_INT24: {
-                    const uint8_t* ptr = src + (ch * 3);
-                    int32_t val24 = (int32_t)((ptr[0] << 0) | (ptr[1] << 8) | (ptr[2] << 16));
-                    // Sign extend from 24 to 32 bits
-                    if (val24 & 0x800000) {
-                        val24 |= 0xFF000000;
-                    }
-                    sample = (float)val24 / 8388608.0f;
-                    break;
-                }
-            }
-
-            output_frames[frame * mem->channels + ch] = sample;
-        }
+    const uint64_t r = RF_ATOMIC_LOAD(&mem->read_index);
+    const uint64_t w = RF_ATOMIC_LOAD(&mem->write_index);
+    const uint64_t available = w - r;
+    if (available > capacity) {
+        // Impossible distance: drop everything and resync our own index.
+        RF_ATOMIC_STORE(&mem->read_index, w);
+        RF_ATOMIC_ADD(&mem->underrun_count, 1);
+        memset(output, 0, output_samples * sizeof(float));
+        return 0;
     }
 
-    // Fill remaining with silence if underrun
-    if (frames_to_read < num_frames) {
-        atomic_fetch_add(&mem->underrun_count, 1);
-        for (uint32_t frame = frames_to_read; frame < num_frames; frame++) {
-            for (uint32_t ch = 0; ch < mem->channels; ch++) {
-                output_frames[frame * mem->channels + ch] = 0.0f;
-            }
+    const uint64_t frames = (available < wanted) ? available : wanted;
+    if (frames > 0) {
+        const float* data = rf_audio_frames(mem);
+        const uint64_t pos = r % capacity;
+        const uint64_t first = (frames < capacity - pos) ? frames : capacity - pos;
+        memcpy(output, data + pos * channels, (size_t)(first * channels) * sizeof(float));
+        if (frames > first) {
+            memcpy(output + first * channels, data, (size_t)((frames - first) * channels) * sizeof(float));
         }
     }
+    const size_t copied_samples = (size_t)(frames * channels);
+    if (copied_samples < output_samples) {
+        memset(output + copied_samples, 0, (output_samples - copied_samples) * sizeof(float));
+    }
+    if (frames < wanted) {
+        RF_ATOMIC_ADD(&mem->underrun_count, 1);
+    }
 
-    atomic_store(&mem->read_index, read_idx + frames_to_read);
-    atomic_fetch_add(&mem->total_frames_read, frames_to_read);
-
-    return num_frames;
+    RF_ATOMIC_STORE(&mem->read_index, r + frames);
+    RF_ATOMIC_ADD(&mem->total_frames_read, frames);
+    return (uint32_t)frames;
 }
 
 /**
- * Update heartbeat (call every ~1 second)
+ * Consumer: drop everything currently queued.
+ * Used when a ring becomes the active one again: whatever a producer wrote
+ * while nobody consumed it is stale and must not be played.
  */
+static inline void rf_ring_consumer_drain(RFSharedAudio* mem) {
+    if (!mem) return;
+    RF_ATOMIC_STORE(&mem->read_index, RF_ATOMIC_LOAD(&mem->write_index));
+}
+
+/** Frames currently queued, clamped to capacity (corrupt distances report 0).
+ */
+static inline uint32_t rf_ring_fill(const RFSharedAudio* mem, const RFAudioLayout* layout) {
+    if (!mem || !layout) return 0;
+    const uint64_t w = RF_ATOMIC_LOAD((_Atomic uint64_t*)&mem->write_index);
+    const uint64_t r = RF_ATOMIC_LOAD((_Atomic uint64_t*)&mem->read_index);
+    const uint64_t used = w - r;
+    return used > layout->capacity_frames ? 0u : (uint32_t)used;
+}
+
+/**
+ * Replace non-finite samples with silence and clamp to [-limit, limit].
+ * Returns the number of non-finite samples found.
+ */
+static inline uint32_t rf_sanitize_samples(float* samples, size_t count, float limit) {
+    uint32_t invalid = 0;
+    if (!samples) return 0;
+    for (size_t i = 0; i < count; i++) {
+        float s = samples[i];
+        if (!isfinite(s)) {
+            samples[i] = 0.0f;
+            invalid++;
+        } else if (s > limit) {
+            samples[i] = limit;
+        } else if (s < -limit) {
+            samples[i] = -limit;
+        }
+    }
+    return invalid;
+}
+
+// ===== HEARTBEAT / STATUS =====
+
 static inline void rf_update_driver_heartbeat(RFSharedAudio* mem) {
-    atomic_fetch_add(&mem->driver_heartbeat, 1);
-    atomic_store(&mem->driver_connected, 1);
+    RF_ATOMIC_ADD(&mem->driver_heartbeat, 1);
+    RF_ATOMIC_STORE(&mem->driver_connected, 1);
 }
 
 static inline void rf_update_host_heartbeat(RFSharedAudio* mem) {
-    atomic_fetch_add(&mem->host_heartbeat, 1);
-    atomic_store(&mem->host_connected, 1);
+    RF_ATOMIC_ADD(&mem->host_heartbeat, 1);
+    RF_ATOMIC_STORE(&mem->host_connected, 1);
 }
 
-// ===== VOLUME CONTROL ACCESSORS =====
-// Driver (writer) side: use memory_order_release to ensure all prior writes
-// are visible to the host before the volume/mute value is published.
-// Host (reader) side: use memory_order_acquire to ensure the volume/mute
-// value is read before any dependent audio processing.
-// This guarantees correct cross-process visibility on ARM/Apple Silicon.
-
-/**
- * Read volume_scalar with acquire semantics (Host/reader side)
- */
-static inline float rf_load_volume_scalar(RFSharedAudio* mem) {
-    return atomic_load_explicit(&mem->volume_scalar, memory_order_acquire);
+static inline uint64_t rf_get_host_heartbeat(const RFSharedAudio* mem) {
+    return RF_ATOMIC_LOAD((_Atomic uint64_t*)&mem->host_heartbeat);
 }
 
-/**
- * Read mute_state with acquire semantics (Host/reader side)
- */
-static inline int32_t rf_load_mute_state(RFSharedAudio* mem) {
-    return atomic_load_explicit(&mem->mute_state, memory_order_acquire);
+static inline uint32_t rf_get_host_connected(const RFSharedAudio* mem) {
+    return RF_ATOMIC_LOAD((_Atomic uint32_t*)&mem->host_connected);
 }
 
-/**
- * Write volume_scalar with release semantics (Driver/writer side)
- */
+static inline void rf_set_driver_connected(RFSharedAudio* mem, bool connected) {
+    RF_ATOMIC_STORE(&mem->driver_connected, connected ? 1u : 0u);
+}
+
+// ===== VOLUME CONTROL =====
+
+/** Clamp to [0, RF_VOLUME_MAX]; non-finite values become 0 (silence). */
+static inline float rf_sanitize_volume(float value) {
+    if (!isfinite(value) || value <= 0.0f) return 0.0f;
+    return value > RF_VOLUME_MAX ? RF_VOLUME_MAX : value;
+}
+
 static inline void rf_store_volume_scalar(RFSharedAudio* mem, float value) {
-    atomic_store_explicit(&mem->volume_scalar, value, memory_order_release);
+    RF_ATOMIC_STORE(&mem->volume_scalar, rf_sanitize_volume(value));
 }
 
-/**
- * Write mute_state with release semantics (Driver/writer side)
- */
-static inline void rf_store_mute_state(RFSharedAudio* mem, int32_t value) {
-    atomic_store_explicit(&mem->mute_state, value, memory_order_release);
+static inline void rf_store_mute_state(RFSharedAudio* mem, bool muted) {
+    RF_ATOMIC_STORE(&mem->mute_state, muted ? 1 : 0);
 }
 
-// ===== EQ SNAPSHOT ACCESSORS =====
-
-/**
- * Write EQ snapshot with SeqLock (App/writer side).
- * Odd sequence = write in progress; even = idle.
- */
-static inline void rf_store_eq_snapshot(RFSharedAudio* mem, const RFEQSnapshot* snapshot) {
-    uint32_t seq = atomic_load_explicit(&mem->eq_sequence, memory_order_relaxed);
-    atomic_store_explicit(&mem->eq_sequence, seq + 1, memory_order_release);
-    memcpy((void*)&mem->eq_snapshot, snapshot, sizeof(RFEQSnapshot));
-    atomic_store_explicit(&mem->eq_sequence, seq + 2, memory_order_release);
+/** Host side: always returns a value in [0, RF_VOLUME_MAX]. */
+static inline float rf_load_volume_scalar(const RFSharedAudio* mem) {
+    return rf_sanitize_volume(RF_ATOMIC_LOAD((_Atomic float*)&mem->volume_scalar));
 }
 
-/**
- * Read EQ snapshot with SeqLock (Host/reader side).
- * Retries if a write was in progress. Returns false if stuck (should not happen).
- */
-static inline bool rf_load_eq_snapshot_safe(const RFSharedAudio* mem, RFEQSnapshot* out) {
-    for (int attempt = 0; attempt < 4; attempt++) {
-        uint32_t seq1 = atomic_load_explicit(
-            (_Atomic uint32_t*)&mem->eq_sequence, memory_order_acquire);
-        if (seq1 & 1) continue;  // Writer active, retry
-        memcpy(out, (const void*)&mem->eq_snapshot, sizeof(RFEQSnapshot));
-        uint32_t seq2 = atomic_load_explicit(
-            (_Atomic uint32_t*)&mem->eq_sequence, memory_order_acquire);
-        if (seq1 == seq2) return true;  // Consistent read
-    }
-    return false;  // Gave up — caller should use previous snapshot
+static inline bool rf_load_mute_state(const RFSharedAudio* mem) {
+    return RF_ATOMIC_LOAD((_Atomic int32_t*)&mem->mute_state) != 0;
 }
 
-/**
- * Legacy reader (kept for backward compatibility, calls safe version).
- */
-static inline void rf_load_eq_snapshot(const RFSharedAudio* mem, RFEQSnapshot* out) {
-    rf_load_eq_snapshot_safe(mem, out);
-}
-
-/**
- * Check if format change is needed
- * Returns true if current format doesn't match requested format
- */
-static inline bool rf_needs_format_change(
-    const RFSharedAudio* mem,
-    uint32_t new_sample_rate,
-    uint32_t new_channels,
-    RFAudioFormat new_format)
-{
-    return (mem->sample_rate != new_sample_rate ||
-            mem->channels != new_channels ||
-            mem->format != new_format);
-}
-
-// ===== TELEMETRY ACCESSORS =====
-// Swift cannot access C11 _Atomic fields directly. These helpers
-// provide safe read access for telemetry logging from Swift.
+// ===== TELEMETRY =====
 
 static inline uint64_t rf_get_underrun_count(const RFSharedAudio* mem) {
-    return atomic_load((_Atomic uint64_t*)&mem->underrun_count);
+    return RF_ATOMIC_LOAD((_Atomic uint64_t*)&mem->underrun_count);
 }
 
 static inline uint64_t rf_get_overrun_count(const RFSharedAudio* mem) {
-    return atomic_load((_Atomic uint64_t*)&mem->overrun_count);
+    return RF_ATOMIC_LOAD((_Atomic uint64_t*)&mem->overrun_count);
+}
+
+// ===== EQ CONTROL (app writes, host reads; separate mapping without audio)
+// =====
+
+#define RF_EQ_MAGIC 0x51454253u /* "SBEQ" */
+#define RF_EQ_PROTOCOL_VERSION 0x00010000u
+#define RF_EQ_CONTROL_SIZE 128u
+#define RF_EQ_BAND_COUNT 10
+#define RF_EQ_GAIN_LIMIT_DB 24.0f
+
+typedef struct {
+    float bands[10]; // dB
+    float preamp;    // dB
+    uint8_t bypass;  // 0 = active, non-zero = bypassed (normalized to 1 on load)
+    uint8_t _pad[3];
+} RFEQSnapshot;
+
+typedef struct {
+    uint32_t magic;
+    uint32_t protocol_version;
+    uint32_t header_size;
+    uint32_t _pad0;
+    uint8_t device_uid_hash[32];
+    _Atomic uint32_t sequence; // SeqLock: odd while the writer is active
+    uint32_t _pad1;
+    RFEQSnapshot snapshot;
+    uint8_t _reserved[24];
+} RFEQControl;
+
+RF_STATIC_ASSERT(sizeof(RFEQSnapshot) == 48, "RFEQSnapshot must be 48 bytes");
+RF_STATIC_ASSERT(sizeof(RFEQControl) == RF_EQ_CONTROL_SIZE, "RFEQControl must be 128 bytes");
+RF_STATIC_ASSERT(offsetof(RFEQControl, snapshot) == 56, "RFEQControl layout drift");
+
+static inline void rf_eq_control_init(RFEQControl* ctl, const uint8_t* device_uid_hash) {
+    memset(ctl, 0, sizeof(RFEQControl));
+    ctl->magic = RF_EQ_MAGIC;
+    ctl->protocol_version = RF_EQ_PROTOCOL_VERSION;
+    ctl->header_size = RF_EQ_CONTROL_SIZE;
+    memcpy(ctl->device_uid_hash, device_uid_hash, RF_UID_HASH_SIZE);
+    RF_ATOMIC_STORE(&ctl->sequence, 0);
+}
+
+static inline bool rf_eq_control_validate(const RFEQControl* ctl, size_t mapped_length,
+                                          const uint8_t* expected_uid_hash) {
+    if (!ctl || mapped_length != RF_EQ_CONTROL_SIZE) return false;
+    if (ctl->magic != RF_EQ_MAGIC || ctl->protocol_version != RF_EQ_PROTOCOL_VERSION ||
+        ctl->header_size != RF_EQ_CONTROL_SIZE) {
+        return false;
+    }
+    if (expected_uid_hash && memcmp(ctl->device_uid_hash, expected_uid_hash, RF_UID_HASH_SIZE) != 0) {
+        return false;
+    }
+    return true;
+}
+
+static inline float rf_eq_clamp_db(float value) {
+    if (value > RF_EQ_GAIN_LIMIT_DB) return RF_EQ_GAIN_LIMIT_DB;
+    if (value < -RF_EQ_GAIN_LIMIT_DB) return -RF_EQ_GAIN_LIMIT_DB;
+    return value;
+}
+
+/** Returns false if any value is non-finite; otherwise clamps and normalizes in
+ * place. */
+static inline bool rf_eq_snapshot_sanitize(RFEQSnapshot* s) {
+    for (int i = 0; i < RF_EQ_BAND_COUNT; i++) {
+        if (!isfinite(s->bands[i])) return false;
+        s->bands[i] = rf_eq_clamp_db(s->bands[i]);
+    }
+    if (!isfinite(s->preamp)) return false;
+    s->preamp = rf_eq_clamp_db(s->preamp);
+    s->bypass = s->bypass != 0 ? 1 : 0;
+    memset(s->_pad, 0, sizeof(s->_pad));
+    return true;
+}
+
+/** Single writer (app). Invalid snapshots are not published. */
+static inline bool rf_eq_store(RFEQControl* ctl, const RFEQSnapshot* snapshot) {
+    RFEQSnapshot copy = *snapshot;
+    if (!rf_eq_snapshot_sanitize(&copy)) return false;
+    uint32_t seq = RF_ATOMIC_LOAD(&ctl->sequence);
+    if (seq & 1u) seq++; // recover from a writer that died mid-update
+    RF_ATOMIC_STORE(&ctl->sequence, seq + 1u);
+    memcpy((void*)&ctl->snapshot, &copy, sizeof(RFEQSnapshot));
+    RF_ATOMIC_STORE(&ctl->sequence, seq + 2u);
+    return true;
+}
+
+/**
+ * Reader (host render thread). Returns true only for a consistent, valid
+ * snapshot; on false the caller must keep its previous snapshot.
+ */
+static inline bool rf_eq_load(const RFEQControl* ctl, RFEQSnapshot* out) {
+    if (!ctl || !out) return false;
+    for (int attempt = 0; attempt < 4; attempt++) {
+        const uint32_t seq1 = RF_ATOMIC_LOAD((_Atomic uint32_t*)&ctl->sequence);
+        if (seq1 & 1u) continue;
+        RFEQSnapshot copy;
+        memcpy(&copy, (const void*)&ctl->snapshot, sizeof(RFEQSnapshot));
+        const uint32_t seq2 = RF_ATOMIC_LOAD((_Atomic uint32_t*)&ctl->sequence);
+        if (seq1 != seq2) continue;
+        if (!rf_eq_snapshot_sanitize(&copy)) return false;
+        *out = copy;
+        return true;
+    }
+    return false;
 }
 
 #ifdef __cplusplus

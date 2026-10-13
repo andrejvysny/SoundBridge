@@ -35,67 +35,43 @@ class AudioEngine {
         return supported.min(by: { abs(Int($0) - Int(rate)) < abs(Int($1) - Int(rate)) }) ?? SoundBridgeConfig.defaultSampleRate
     }
 
-    /// Setup with device fallback - tries preferred device first, then validated devices
+    /// Binds the output unit. With a preferred device only that device is tried:
+    /// silently moving audio to another output could expose private playback on
+    /// speakers the user did not select. Without a preference (no active proxy,
+    /// so nothing is rendered) validated devices are tried in order.
     func setup(devices: [PhysicalDevice], preferredDeviceID: AudioDeviceID? = nil) throws {
+        stop()
         guard !devices.isEmpty else {
             throw AudioEngineError.noPhysicalDeviceFound
         }
 
-        var lastError: AudioEngineError?
-
-        // Try preferred device FIRST if specified
-        if let preferredID = preferredDeviceID,
-           let preferredDevice = devices.first(where: { $0.id == preferredID }) {
-            let validationStatus = preferredDevice.validationPassed ? "✓" : "⚠"
-            print("[AudioEngine] Trying preferred device: \(preferredDevice.name) \(validationStatus)")
-
-            if !preferredDevice.validationPassed {
-                logger.warning("\(preferredDevice.validationNote ?? "Device may not work properly")")
+        if let preferredID = preferredDeviceID {
+            guard let preferredDevice = devices.first(where: { $0.id == preferredID }) else {
+                throw AudioEngineError.preferredDeviceUnavailable
             }
-
             do {
                 try setupWithDevice(preferredDevice)
-                logger.info("Successfully bound to preferred device: \(preferredDevice.name)")
+                logger.info("Bound to preferred device: \(preferredDevice.name)")
                 return
-            } catch let error as AudioEngineError {
-                logger.error("Preferred device failed: \(error.description)")
-                print("[AudioEngine] Falling back to other devices...")
-                lastError = error
+            } catch {
                 cleanupFailedSetup()
+                throw error
             }
         }
 
-        // Sort remaining devices: validated first, then by original order
-        let remainingDevices = devices.filter { $0.id != preferredDeviceID }
-        let sortedDevices = remainingDevices.sorted { d1, d2 in
-            if d1.validationPassed && !d2.validationPassed { return true }
-            if !d1.validationPassed && d2.validationPassed { return false }
-            return false // Maintain original order within same validation status
-        }
-
-        let validatedCount = sortedDevices.filter { $0.validationPassed }.count
-        print("[AudioEngine] Attempting fallback with \(sortedDevices.count) devices (\(validatedCount) validated)")
-
-        for (index, device) in sortedDevices.enumerated() {
-            let validationStatus = device.validationPassed ? "✓" : "⚠"
-            print("[AudioEngine] [\(index + 1)/\(sortedDevices.count)] Trying: \(device.name) \(validationStatus)")
-
-            if !device.validationPassed {
-                logger.warning("\(device.validationNote ?? "Device may not work properly")")
-            }
-
+        var lastError: Error?
+        let sortedDevices = devices.filter(\.validationPassed) + devices.filter { !$0.validationPassed }
+        for device in sortedDevices {
             do {
                 try setupWithDevice(device)
-                logger.info("Successfully bound to: \(device.name)")
+                logger.info("Bound to: \(device.name)")
                 return
-            } catch let error as AudioEngineError {
-                logger.error("Failed: \(error.description)")
+            } catch {
+                logger.error("Failed: \(String(describing: error))")
                 lastError = error
                 cleanupFailedSetup()
             }
         }
-
-        // All devices failed
         throw lastError ?? AudioEngineError.allDevicesFailed
     }
 
@@ -185,15 +161,8 @@ class AudioEngine {
             throw AudioEngineError.unitNotInitialized
         }
 
-        // 检测采样率变化
         let newSampleRate = getDeviceNominalSampleRate(deviceID)
         let needsFormatUpdate = (newSampleRate != SoundBridgeConfig.activeSampleRate)
-
-        if needsFormatUpdate {
-            print("[AudioEngine] Sample rate change detected: \(SoundBridgeConfig.activeSampleRate)Hz → \(newSampleRate)Hz")
-            SoundBridgeConfig.activeSampleRate = newSampleRate
-            renderer.updateSampleRate(newSampleRate)
-        }
 
         var isRunning: UInt32 = 0
         var size = UInt32(MemoryLayout<UInt32>.size)
@@ -206,11 +175,17 @@ class AudioEngine {
             &size
         ) == noErr && isRunning != 0
 
+        // Stop before touching sample-rate-dependent DSP state the callback uses.
         if wasRunning {
             AudioOutputUnitStop(unit)
         }
+        if needsFormatUpdate {
+            logger.info("Sample rate change: \(SoundBridgeConfig.activeSampleRate) Hz -> \(newSampleRate) Hz")
+            SoundBridgeConfig.activeSampleRate = newSampleRate
+            renderer.updateSampleRate(newSampleRate)
+        }
 
-        // 切换设备
+        // Switch device
         var newDeviceID = deviceID
         let status = AudioUnitSetProperty(
             unit,
@@ -227,7 +202,7 @@ class AudioEngine {
 
         currentDeviceID = deviceID
 
-        // 如果采样率变化，重新设置 stream format
+        // Sample rate changed: reapply the stream format
         if needsFormatUpdate {
             AudioUnitUninitialize(unit)
             try setFormat()
@@ -358,6 +333,7 @@ enum AudioEngineError: Error, CustomStringConvertible {
     case initializationFailed(OSStatus)
     case startFailed(OSStatus)
     case deviceSwitchFailed(OSStatus)
+    case preferredDeviceUnavailable
     case noPhysicalDeviceFound
     case noValidDeviceFound
     case allDevicesFailed
@@ -382,6 +358,8 @@ enum AudioEngineError: Error, CustomStringConvertible {
             return "Failed to start audio unit (OSStatus: \(status))"
         case .deviceSwitchFailed(let status):
             return "Failed to switch device (OSStatus: \(status))"
+        case .preferredDeviceUnavailable:
+            return "Preferred output device is no longer available"
         case .noPhysicalDeviceFound:
             return "No physical output device found in registry"
         case .noValidDeviceFound:

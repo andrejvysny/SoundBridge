@@ -1,4 +1,5 @@
 module CSoundBridgeAudio {
     header "RFSharedAudio.h"
+    header "RFSecureIPC.h"
     export *
 }

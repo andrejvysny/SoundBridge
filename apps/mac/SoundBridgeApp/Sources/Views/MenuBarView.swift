@@ -314,71 +314,7 @@ struct UninstallButton: View {
     }
 
     private func performUninstall() {
-        let alert = NSAlert()
-        alert.messageText = "Uninstall SoundBridge Driver"
-        alert.informativeText = "This will remove the audio driver, stop background processes, and clear configuration data. The app itself will not be deleted — you can reinstall the driver anytime."
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Uninstall Driver")
-        alert.addButton(withTitle: "Cancel")
-
-        let response = alert.runModal()
-        guard response == .alertFirstButtonReturn else { return }
-
-        // Tell AppDelegate we're uninstalling so Host's terminationHandler
-        // won't call NSApp.terminate prematurely.
-        if let appDelegate = NSApp.delegate as? AppDelegate {
-            appDelegate.isUninstalling = true
-        }
-
-        // Step 1: Kill host and remove driver (requires admin).
-        // Each command is guarded with "|| true" so a single failure
-        // (e.g. coreaudiod restart returning non-zero) does not abort
-        // the entire script and cause the app to skip cleanup.
-        let script = """
-        do shell script "killall SoundBridgeHost 2>/dev/null || true; \
-        rm -rf /Library/Audio/Plug-Ins/HAL/SoundBridgeDriver.driver || true; \
-        rm -f /tmp/soundbridge-devices.txt 2>/dev/null || true; \
-        rm -f /tmp/soundbridge-* 2>/dev/null || true; \
-        killall coreaudiod 2>/dev/null || true" with administrator privileges
-        """
-
-        let appleScript = NSAppleScript(source: script)
-        var error: NSDictionary?
-        appleScript?.executeAndReturnError(&error)
-
-        // Proceed with user-level cleanup regardless of AppleScript result.
-        // The admin script may report an error even when it partially succeeded
-        // (e.g. coreaudiod restart returns non-zero), so we always clean up.
-
-        // Clean up Application Support data
-        let fm = FileManager.default
-        if let appSupport = fm.urls(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask
-        ).first?.appendingPathComponent("SoundBridge") {
-            try? fm.removeItem(at: appSupport)
-        }
-
-        // Clean up log directory
-        if let logsDir = fm.urls(
-            for: .libraryDirectory,
-            in: .userDomainMask
-        ).first?.appendingPathComponent("Logs/SoundBridge") {
-            try? fm.removeItem(at: logsDir)
-        }
-
-        // Clean up UserDefaults (onboarding state)
-        let defaults = UserDefaults.standard
-        for key in ["hasCompletedOnboarding", "onboardingVersion",
-                     "driverInstallDate", "lastDriverVersionCheck"] {
-            defaults.removeObject(forKey: key)
-        }
-        defaults.synchronize()
-
-        // Give coreaudiod time to restart, then quit
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-            NSApp.terminate(nil)
-        }
+        UninstallCoordinator.run()
     }
 }
 

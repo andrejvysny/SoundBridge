@@ -20,11 +20,17 @@ class ProxyDeviceManager {
     private let volumeForwardEpsilon: Float32 = 0.001
     private var lastForwardedProxyVolume: Float32?
     let volumePersistence: VolumePersistence
+    /// Serializes bounces; a second request while one runs is dropped.
+    private let bounceLock = NSLock()
+
+    /// Invoked whenever the routed physical device changes (nil = none).
+    var onActiveProxyChanged: ((String?) -> Void)?
 
     var activeProxyUID: String? {
         didSet {
             registry.activeDeviceUID = activeProxyUID
             registry.writeDeviceStateFile()
+            onActiveProxyChanged?(activeProxyUID)
         }
     }
     var activePhysicalDeviceID: AudioDeviceID = 0
@@ -118,34 +124,110 @@ class ProxyDeviceManager {
         return result == noErr
     }
 
-    /// Bounce the default device: proxy → physical → proxy.
-    /// Forces apps that cache the device ID to re-bind to the new default.
-    func bounceDevice() {
+    enum BounceOutcome: Equatable {
+        case completed
+        case skipped(String)
+    }
+
+    /// Bounce the default output away from the active proxy and back so apps
+    /// that cache the device ID re-bind.
+    ///
+    /// The intermediate device must not play audio the user could hear at a
+    /// level SoundBridge did not approve, so it is either another SoundBridge
+    /// proxy (the host renders only the active one, so it is silent) or the
+    /// physical device with its hardware mute engaged. Otherwise the bounce is
+    /// refused rather than bypassing software mute/volume.
+    @discardableResult
+    func bounceDevice() -> BounceOutcome {
+        guard bounceLock.try() else { return .skipped("bounce already in progress") }
+        defer { bounceLock.unlock() }
+
         let proxyID = activeProxyDeviceID
         let physicalID = activePhysicalDeviceID
         guard proxyID != 0, physicalID != 0 else {
-            logger.info("[Bounce] No active proxy/physical pair — skipping")
-            return
+            return .skipped("no active proxy/physical pair")
         }
 
-        print("[Bounce] Triggering device bounce to recapture audio streams...")
+        if let silentProxy = findSilentBounceTarget(excluding: proxyID) {
+            return performBounce(through: silentProxy, back: proxyID)
+                ? .completed
+                : .skipped("could not switch back to the SoundBridge device")
+        }
+
+        guard let previousMute = getDeviceMute(physicalID), isMuteSettable(physicalID),
+              setDeviceMute(physicalID, muted: true) else {
+            logger.warning("Bounce refused: no silent intermediate output available")
+            return .skipped("no silent intermediate output")
+        }
+        guard performBounce(through: physicalID, back: proxyID) else {
+            // The physical device is still the default: leave it muted rather
+            // than let it play at hardware level without software attenuation.
+            logger.error("Bounce failed to restore the SoundBridge device; physical output left muted")
+            return .skipped("output left muted: could not switch back to the SoundBridge device")
+        }
+        _ = setDeviceMute(physicalID, muted: previousMute)
+        return .completed
+    }
+
+    /// Returns true only once the proxy is the default output again.
+    @discardableResult
+    private func performBounce(through intermediateID: AudioDeviceID, back proxyID: AudioDeviceID) -> Bool {
         isAutoSwitching = true
-        bounceUntilTime = Date().addingTimeInterval(1.0) // 1s window for async callbacks
-
-        // Step 1: Switch both default + system output to physical device
-        setDefaultAndSystemDevice(physicalID)
-
-        // Step 2: Wait for apps to notice the change
-        Thread.sleep(forTimeInterval: 0.2)
-
-        // Step 3: Switch both back to proxy
+        bounceUntilTime = Date().addingTimeInterval(1.0) // window for async callbacks
+        setDefaultAndSystemDevice(intermediateID)
+        Thread.sleep(forTimeInterval: 0.2) // let apps observe the change
         setDefaultAndSystemDevice(proxyID)
-
+        var restored = getCurrentDefaultDevice() == proxyID
+        if !restored {
+            setDefaultAndSystemDevice(proxyID) // one retry
+            restored = getCurrentDefaultDevice() == proxyID
+        }
         lastSwitchTime = Date()
         DispatchQueue.main.asyncAfter(deadline: .now() + switchCooldown) { [weak self] in
             self?.isAutoSwitching = false
         }
-        print("[Bounce] Device bounce complete")
+        if restored {
+            logger.info("Device bounce complete")
+        }
+        return restored
+    }
+
+    /// Another live SoundBridge proxy. Its ring is not rendered, so audio sent
+    /// there during the bounce window is dropped.
+    private func findSilentBounceTarget(excluding proxyID: AudioDeviceID) -> AudioDeviceID? {
+        for deviceID in allDeviceIDs() where deviceID != proxyID {
+            if let uid = getDeviceUID(deviceID), uid.hasSuffix("-soundbridge") {
+                return deviceID
+            }
+        }
+        return nil
+    }
+
+    private func allDeviceIDs() -> [AudioDeviceID] {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var dataSize: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &dataSize) == noErr else {
+            return []
+        }
+        var deviceIDs = [AudioDeviceID](repeating: 0, count: Int(dataSize) / MemoryLayout<AudioDeviceID>.size)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &dataSize, &deviceIDs) == noErr else {
+            return []
+        }
+        return deviceIDs
+    }
+
+    private func isMuteSettable(_ deviceID: AudioDeviceID) -> Bool {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyMute,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var settable: DarwinBoolean = false
+        return AudioObjectIsPropertySettable(deviceID, &address, &settable) == noErr && settable.boolValue
     }
 
     /// Set both default output and system output device in one call.
@@ -633,19 +715,23 @@ class ProxyDeviceManager {
 
         let proxyDeviceID = activeProxyDeviceID
         let physicalDeviceID = activePhysicalDeviceID
+        let physicalUID = activeProxyUID
         guard proxyDeviceID != 0, physicalDeviceID != 0 else { return }
 
         volumeForwardQueue.async { [weak self] in
-            self?.forwardProxyMuteToPhysical(proxyDeviceID: proxyDeviceID, physicalDeviceID: physicalDeviceID)
+            self?.forwardProxyMuteToPhysical(
+                proxyDeviceID: proxyDeviceID, physicalDeviceID: physicalDeviceID, physicalUID: physicalUID
+            )
         }
     }
 
-    private func forwardProxyMuteToPhysical(proxyDeviceID: AudioDeviceID, physicalDeviceID: AudioDeviceID) {
+    private func forwardProxyMuteToPhysical(
+        proxyDeviceID: AudioDeviceID, physicalDeviceID: AudioDeviceID, physicalUID: String?
+    ) {
         guard let muted = getDeviceMute(proxyDeviceID) else { return }
         _ = setDeviceMute(physicalDeviceID, muted: muted)
 
-        // Persist mute state for the physical device
-        if let physicalUID = activeProxyUID {
+        if let physicalUID {
             let volume = getDeviceVolume(proxyDeviceID) ?? VolumePersistence.defaultVolume
             volumePersistence.save(uid: physicalUID, volume: volume, muted: muted)
         }
@@ -725,8 +811,9 @@ class ProxyDeviceManager {
 
         let proxyID = activeProxyDeviceID
         let physicalID = activePhysicalDeviceID
+        let physicalUID = activeProxyUID
         volumeForwardQueue.async { [weak self] in
-            self?.forwardProxyMuteToPhysical(proxyDeviceID: proxyID, physicalDeviceID: physicalID)
+            self?.forwardProxyMuteToPhysical(proxyDeviceID: proxyID, physicalDeviceID: physicalID, physicalUID: physicalUID)
         }
 
         if attempt > 1 {
@@ -739,6 +826,7 @@ class ProxyDeviceManager {
     private func enqueueProxyVolumeForward(force: Bool = false) {
         let proxyDeviceID = activeProxyDeviceID
         let physicalDeviceID = activePhysicalDeviceID
+        let physicalUID = activeProxyUID
         guard proxyDeviceID != 0, physicalDeviceID != 0 else {
             return
         }
@@ -747,6 +835,7 @@ class ProxyDeviceManager {
             self?.forwardProxyVolumeToPhysical(
                 proxyDeviceID: proxyDeviceID,
                 physicalDeviceID: physicalDeviceID,
+                physicalUID: physicalUID,
                 force: force
             )
         }
@@ -755,6 +844,7 @@ class ProxyDeviceManager {
     private func forwardProxyVolumeToPhysical(
         proxyDeviceID: AudioDeviceID,
         physicalDeviceID: AudioDeviceID,
+        physicalUID: String?,
         force: Bool = false
     ) {
         guard let proxyVolume = getDeviceVolume(proxyDeviceID) else {
@@ -768,14 +858,15 @@ class ProxyDeviceManager {
         lastForwardedProxyVolume = proxyVolume
         _ = setDeviceVolume(physicalDeviceID, volume: proxyVolume)
 
-        // Persist volume state for the physical device
-        if let physicalUID = activeProxyUID {
+        if let physicalUID {
             let muted = getDeviceMute(proxyDeviceID) ?? false
             volumePersistence.save(uid: physicalUID, volume: proxyVolume, muted: muted)
         }
     }
 }
 
+// HAL listener callbacks arrive on arbitrary threads; control-plane state is
+// owned by the main queue, so hop there before touching it.
 private func proxyVolumeChangedCallback(
     _ objectID: AudioObjectID,
     _ numberAddresses: UInt32,
@@ -784,7 +875,7 @@ private func proxyVolumeChangedCallback(
 ) -> OSStatus {
     guard let clientData else { return noErr }
     let manager = Unmanaged<ProxyDeviceManager>.fromOpaque(clientData).takeUnretainedValue()
-    manager.handleProxyVolumeChanged(from: objectID)
+    DispatchQueue.main.async { manager.handleProxyVolumeChanged(from: objectID) }
     return noErr
 }
 
@@ -796,6 +887,6 @@ private func proxyMuteChangedCallback(
 ) -> OSStatus {
     guard let clientData else { return noErr }
     let manager = Unmanaged<ProxyDeviceManager>.fromOpaque(clientData).takeUnretainedValue()
-    manager.handleProxyMuteChanged(from: objectID)
+    DispatchQueue.main.async { manager.handleProxyMuteChanged(from: objectID) }
     return noErr
 }

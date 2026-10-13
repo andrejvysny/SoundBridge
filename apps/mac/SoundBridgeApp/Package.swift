@@ -50,10 +50,11 @@ let package = Package(
         )
     ],
     dependencies: [
-        // Sparkle 2.x for auto-updates
-        .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.5.0"),
+        // Exact pins: updates to the updater are reviewed deliberately (see SECURITY.md).
+        // Package.resolved is committed and CI resolves with --force-resolved-versions.
+        .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.10.0"),
         // SwiftCheck for property-based testing
-        .package(url: "https://github.com/typelift/SwiftCheck", from: "0.12.0")
+        .package(url: "https://github.com/typelift/SwiftCheck", exact: "0.12.0")
     ],
     targets: [
         .target(

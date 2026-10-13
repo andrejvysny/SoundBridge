@@ -151,8 +151,9 @@ private struct DriverInstallStepView: View {
         }
         .padding(.horizontal, 40)
         .onAppear {
-            // If driver is already installed, skip to completion
-            if installer.isDriverInstalled() {
+            // Skip only when the installed driver actually matches this app;
+            // an old or broken driver still goes through update/repair.
+            if installer.currentAction() == .none {
                 installer.state = .complete
                 installer.progress = 1.0
             }
@@ -234,14 +235,21 @@ private struct DriverInstallStepView: View {
     // MARK: - Actions
 
     private func installDriver() {
-        Task {
-            do {
-                try await installer.installDriver()
-            } catch {
-                await MainActor.run {
-                    installer.state = .failed(error.localizedDescription)
+        Task { @MainActor in
+            let action = installer.currentAction()
+            guard let operation = DriverOperation(action: action) else {
+                if case .newerIncompatibleInstalled(let version) = action {
+                    installer.state = .failed(DriverInstallError.downgradeRefused(version).localizedDescription)
+                } else if action == .bundleMissing {
+                    installer.state = .failed(DriverInstallError.driverNotFound.localizedDescription)
+                } else {
+                    installer.state = .complete
+                    installer.progress = 1.0
                 }
+                return
             }
+            // perform() already records cancellation and failure in installer.state.
+            _ = try? await installer.perform(operation)
         }
     }
 }

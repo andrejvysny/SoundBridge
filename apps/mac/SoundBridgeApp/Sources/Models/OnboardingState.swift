@@ -5,7 +5,6 @@ enum OnboardingKey {
     static let hasCompletedOnboarding = "hasCompletedOnboarding"
     static let driverInstallDate = "driverInstallDate"
     static let onboardingVersion = "onboardingVersion"
-    static let lastDriverVersionCheck = "lastDriverVersionCheck"
 }
 
 /// Manages onboarding state persistence using UserDefaults
@@ -39,15 +38,5 @@ struct OnboardingState {
     /// Get current onboarding version
     static func version() -> Int {
         return UserDefaults.standard.integer(forKey: OnboardingKey.onboardingVersion)
-    }
-
-    /// Get last driver version that was checked
-    static func lastDriverVersionCheck() -> String? {
-        return UserDefaults.standard.string(forKey: OnboardingKey.lastDriverVersionCheck)
-    }
-
-    /// Update last checked driver version
-    static func updateLastDriverVersionCheck(_ version: String) {
-        UserDefaults.standard.set(version, forKey: OnboardingKey.lastDriverVersionCheck)
     }
 }

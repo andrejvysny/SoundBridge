@@ -58,7 +58,14 @@ struct SettingsView: View {
 							.foregroundColor(.primary)
 
 						VStack(alignment: .leading, spacing: 12) {
+							if updaterController == nil {
+								Text("Updates are not configured for this build.")
+									.font(.caption)
+									.foregroundColor(.secondary)
+							}
+
 							Toggle("Automatically check for updates", isOn: $automaticCheckEnabled)
+								.disabled(updaterController == nil)
 								.onChange(of: automaticCheckEnabled) { newValue in
 									updaterController?.updater.automaticallyChecksForUpdates = newValue
 								}
@@ -87,7 +94,7 @@ struct SettingsView: View {
 								}
 								.frame(maxWidth: .infinity)
 							}
-							.disabled(isCheckingForUpdates)
+							.disabled(isCheckingForUpdates || updaterController == nil)
 							.controlSize(.large)
 						}
 					}
@@ -148,7 +155,7 @@ struct SettingsView: View {
 		}
 		.frame(width: 500, height: 450)
 		.onAppear {
-			automaticCheckEnabled = updaterController?.updater.automaticallyChecksForUpdates ?? true
+			automaticCheckEnabled = updaterController?.updater.automaticallyChecksForUpdates ?? false
 		}
 	}
 

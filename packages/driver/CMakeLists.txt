@@ -29,6 +29,7 @@ add_subdirectory(vendor/libASPL)
 # SoundBridge Driver sources
 set(DRIVER_SOURCES
     src/Plugin.cpp
+    src/AudioHandler.cpp
 )
 
 # Create the driver bundle
@@ -41,12 +42,18 @@ target_include_directories(SoundBridgeDriver
         ${CMAKE_CURRENT_SOURCE_DIR}/vendor/libASPL/src
 )
 
+target_compile_definitions(SoundBridgeDriver
+    PRIVATE
+        SOUNDBRIDGE_DRIVER_VERSION="${PROJECT_VERSION}"
+)
+
 target_link_libraries(SoundBridgeDriver
     PRIVATE
         libASPL
         "-framework CoreAudio"
         "-framework CoreFoundation"
         "-framework AudioToolbox"
+        "-framework SystemConfiguration"
 )
 
 # Bundle properties
@@ -65,7 +72,6 @@ set_target_properties(SoundBridgeDriver PROPERTIES
 
 message(STATUS "SoundBridge HAL Driver configured")
 message(STATUS "  Build type: ${CMAKE_BUILD_TYPE}")
-message(STATUS "  Multi-format: YES (int16/24/32, float32/64)")
-message(STATUS "  Multi-rate: YES (44.1-192 kHz)")
-message(STATUS "  Multi-channel: YES (1-8 channels)")
+message(STATUS "  Stream input: int16/24/32, float32/64 -> stereo float32 transport")
+message(STATUS "  Transport rates: 44.1-192 kHz")
 message(STATUS "  Install manually to: /Library/Audio/Plug-Ins/HAL/")

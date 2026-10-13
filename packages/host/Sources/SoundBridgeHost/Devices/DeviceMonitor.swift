@@ -139,7 +139,7 @@ class DeviceMonitor {
         // 1. Create shared memory for new devices
         for device in addedDevices {
             print("Device added: \(device.name) (\(discovery.transportTypeName(device.transportType)))")
-            _ = memoryManager.createMemory(for: device.uid)
+            memoryManager.createMemory(for: device.uid, sampleRate: SoundBridgeConfig.activeSampleRate)
         }
 
         for device in removedDevices {
@@ -149,14 +149,16 @@ class DeviceMonitor {
         // 2. Update registry (writes control file + sends Darwin notification)
         registry.update(newDevices)
 
-        // 3. Delay shared memory removal for removed devices
-        if !removedDevices.isEmpty {
-            let removedUIDs = removedDevices.map { $0.uid }
-            DispatchQueue.main.asyncAfter(deadline: .now() + SoundBridgeConfig.cleanupWaitTimeout) {
-                [weak self] in
+        // 3. Delay shared memory removal for removed devices. The token is
+        // captured now so a replug before the delay expires keeps its mapping.
+        let removals = removedDevices.compactMap { device in
+            memoryManager.removalToken(for: device.uid).map { (uid: device.uid, token: $0) }
+        }
+        if !removals.isEmpty {
+            DispatchQueue.main.asyncAfter(deadline: .now() + SoundBridgeConfig.cleanupWaitTimeout) { [weak self] in
                 guard let self else { return }
-                for uid in removedUIDs {
-                    self.memoryManager.removeMemory(for: uid)
+                for removal in removals {
+                    self.memoryManager.removeMemory(for: removal.uid, token: removal.token)
                 }
             }
         }
@@ -303,7 +305,7 @@ class DeviceMonitor {
 }
 
 // File-level C callbacks — stable function pointers required for AudioObjectRemovePropertyListener.
-// AudioObjectPropertyListenerProc requires non-optional UnsafePointer<AudioObjectPropertyAddress>.
+// HAL invokes them on its own threads; all control-plane state is owned by the main queue.
 private func deviceListChangedCallbackC(
     _ objectID: AudioObjectID,
     _ numAddresses: UInt32,
@@ -311,8 +313,8 @@ private func deviceListChangedCallbackC(
     _ clientData: UnsafeMutableRawPointer?
 ) -> OSStatus {
     guard let clientData else { return noErr }
-    Unmanaged<DeviceMonitor>.fromOpaque(clientData).takeUnretainedValue()
-        .handleDeviceListChanged()
+    let monitor = Unmanaged<DeviceMonitor>.fromOpaque(clientData).takeUnretainedValue()
+    DispatchQueue.main.async { monitor.handleDeviceListChanged() }
     return noErr
 }
 
@@ -323,7 +325,7 @@ private func defaultOutputChangedCallbackC(
     _ clientData: UnsafeMutableRawPointer?
 ) -> OSStatus {
     guard let clientData else { return noErr }
-    Unmanaged<DeviceMonitor>.fromOpaque(clientData).takeUnretainedValue()
-        .handleDefaultOutputChanged()
+    let monitor = Unmanaged<DeviceMonitor>.fromOpaque(clientData).takeUnretainedValue()
+    DispatchQueue.main.async { monitor.handleDefaultOutputChanged() }
     return noErr
 }

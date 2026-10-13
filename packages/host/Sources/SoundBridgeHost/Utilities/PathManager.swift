@@ -24,15 +24,6 @@ struct PathManager {
         return url
     }()
 
-    static func sharedMemoryPath(uid: String) -> String {
-        let safeUID = sanitizeUID(uid)
-        return "/tmp/soundbridge-\(safeUID)"
-    }
-
-    static var controlFilePath: String {
-        return "/tmp/soundbridge-devices.txt"
-    }
-
     static func logFilePath(name: String) -> URL {
         return logsDir.appendingPathComponent("\(name).log")
     }
@@ -61,12 +52,5 @@ struct PathManager {
         } catch {
             throw PathManagerError.directoryCreationFailed(url.path)
         }
-    }
-
-    private static func sanitizeUID(_ uid: String) -> String {
-        return uid
-            .replacingOccurrences(of: ":", with: "_")
-            .replacingOccurrences(of: "/", with: "_")
-            .replacingOccurrences(of: " ", with: "_")
     }
 }

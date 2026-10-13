@@ -14,7 +14,8 @@ struct DeviceVolumeState: Codable {
 /// Storage: `~/Library/Application Support/SoundBridge/volume-state.json`
 /// - In-memory cache for fast reads
 /// - 500ms debounce on writes to avoid excessive I/O during slider drag
-/// - Atomic write (.tmp + rename) to prevent corruption
+/// - Atomic write (temporary file + rename) to prevent corruption
+/// - Values are clamped on save and load; a corrupt file cannot request > 100% gain
 class VolumePersistence {
     static let defaultVolume: Float = 0.35
 
@@ -34,7 +35,7 @@ class VolumePersistence {
     func save(uid: String, volume: Float, muted: Bool) {
         queue.async { [weak self] in
             guard let self else { return }
-            self.cache[uid] = DeviceVolumeState(volumeScalar: volume, isMuted: muted)
+            self.cache[uid] = DeviceVolumeState(volumeScalar: Self.sanitizedVolume(volume), isMuted: muted)
             self.scheduleDebouncedWrite()
         }
     }
@@ -45,6 +46,12 @@ class VolumePersistence {
         return queue.sync {
             cache[uid] ?? DeviceVolumeState(volumeScalar: Self.defaultVolume, isMuted: false)
         }
+    }
+
+    /// Non-finite values fall back to the default; the rest is clamped to [0, 1].
+    static func sanitizedVolume(_ value: Float) -> Float {
+        guard value.isFinite else { return defaultVolume }
+        return min(max(value, 0), 1)
     }
 
     // MARK: - Private
@@ -69,7 +76,9 @@ class VolumePersistence {
             do {
                 let data = try Data(contentsOf: self.fileURL)
                 let decoded = try JSONDecoder().decode([String: DeviceVolumeState].self, from: data)
-                self.cache = decoded
+                self.cache = decoded.mapValues {
+                    DeviceVolumeState(volumeScalar: Self.sanitizedVolume($0.volumeScalar), isMuted: $0.isMuted)
+                }
                 logger.info("Loaded state for \(decoded.count) device(s)")
             } catch {
                 logger.error("Failed to load state: \(error.localizedDescription)")
@@ -80,17 +89,8 @@ class VolumePersistence {
     private func writeToDisk() {
         do {
             let data = try JSONEncoder().encode(cache)
-
-            // Atomic write: write to .tmp first, then rename
-            let tmpURL = fileURL.appendingPathExtension("tmp")
-            try data.write(to: tmpURL, options: [.atomic])
-
-            // Rename .tmp → final path
-            let fm = FileManager.default
-            if fm.fileExists(atPath: fileURL.path) {
-                try fm.removeItem(at: fileURL)
-            }
-            try fm.moveItem(at: tmpURL, to: fileURL)
+            // .atomic replaces the destination with a single rename.
+            try data.write(to: fileURL, options: [.atomic])
 
             logger.info("Saved state for \(self.cache.count) device(s)")
         } catch {

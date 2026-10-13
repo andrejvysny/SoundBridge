@@ -4,10 +4,6 @@ import Combine
 import Darwin
 import os.log
 
-// Darwin notify API — not always visible during x86_64 cross-compilation.
-@_silgen_name("notify_post")
-private func _notify_post(_ name: UnsafePointer<CChar>) -> UInt32
-
 private let logger = Logger(subsystem: "com.soundbridge.app", category: "VolumeController")
 
 /// Format an OSStatus as a FourCC string for readable CoreAudio error logging.
@@ -658,12 +654,11 @@ class VolumeController: ObservableObject {
 
     // MARK: - Device Bounce (Reconnect Audio)
 
-    /// Request the Host process to bounce the audio device via IPC.
-    /// This triggers a Darwin notification that the Host listens for.
+    /// Ask the Host to bounce the audio device. The Host only honors a fresh
+    /// token written to the owner-only session directory.
     func bounceDevice() {
-        // Use _notify_post to send bounce request to Host — Host is the single
-        // source of truth for CoreAudio device control.
-        _ = _notify_post("com.soundbridge.bounce-request")
-        logger.info("Sent bounce request to Host")
+        if AppSessionIPC.requestBounce() {
+            logger.info("Sent bounce request to Host")
+        }
     }
 }

@@ -1,296 +1,187 @@
+import AppKit
 import Foundation
-@preconcurrency import AppKit
+
+enum DriverOperation: String {
+    case install
+    case update
+    case repair
+    case uninstall
+
+    /// Privileged operation needed to resolve an action, if any.
+    init?(action: DriverAction) {
+        switch action {
+        case .install: self = .install
+        case .update: self = .update
+        case .repair, .reloadRequired: self = .repair
+        case .none, .newerIncompatibleInstalled, .bundleMissing: return nil
+        }
+    }
+}
+
+enum DriverInstallResult: Equatable {
+    /// Installed bundle verified and Core Audio reports the expected build.
+    case verified(DriverIdentity)
+    case removed
+}
 
 /// Driver installation states
 enum DriverInstallState: Equatable {
     case notStarted
-    case checkingExisting
-    case copying
-    case settingPermissions
-    case restartingAudio
+    case authorizing
     case verifying
     case complete
     case failed(String)
 
-    var isComplete: Bool {
-        if case .complete = self {
-            return true
-        }
-        return false
-    }
+    var isComplete: Bool { self == .complete }
 
     var isFailed: Bool {
-        if case .failed = self {
-            return true
-        }
+        if case .failed = self { return true }
         return false
     }
 
     var description: String {
         switch self {
-        case .notStarted:
-            return "Ready to install"
-        case .checkingExisting:
-            return "Checking for existing driver..."
-        case .copying:
-            return "Copying driver files..."
-        case .settingPermissions:
-            return "Setting permissions..."
-        case .restartingAudio:
-            return "Restarting audio system..."
-        case .verifying:
-            return "Verifying installation..."
-        case .complete:
-            return "Installation complete!"
-        case .failed(let error):
-            return "Failed: \(error)"
+        case .notStarted: return "Ready to install"
+        case .authorizing: return "Installing driver..."
+        case .verifying: return "Verifying installation..."
+        case .complete: return "Installation complete!"
+        case .failed(let error): return "Failed: \(error)"
         }
     }
 }
 
-/// Handles driver installation and verification
-class DriverInstaller: ObservableObject {
+/// Installs, updates, repairs, and removes the HAL driver through the fixed
+/// privileged script, then verifies the result independently.
+@MainActor
+final class DriverInstaller: ObservableObject {
     @Published var state: DriverInstallState = .notStarted
     @Published var progress: Double = 0.0
 
-    private let driverName = "SoundBridgeDriver.driver"
-    private let driverDestination = "/Library/Audio/Plug-Ins/HAL"
+    /// Seconds to wait for Core Audio to reload the plug-in after a restart.
+    private let loadTimeout: TimeInterval = 8.0
 
-    /// Install the driver with progress updates
-    func installDriver() async throws {
-        await MainActor.run { state = .checkingExisting; progress = 0.1 }
-
-        // Check if driver is already installed (fast file check)
-        if isDriverInstalled() {
-            print("Driver already installed, skipping installation")
-            await MainActor.run { state = .complete; progress = 1.0 }
-            return
-        }
-
-        await MainActor.run { state = .copying; progress = 0.3 }
-
-        // Find driver bundle in app resources
-        guard let driverSource = findDriverBundle() else {
-            throw DriverInstallError.driverNotFound
-        }
-
-        // Install driver with single admin prompt (copy + permissions + restart)
-        try await installDriverWithPrivileges(from: driverSource)
-
-        // Update progress through the stages
-        await MainActor.run { state = .settingPermissions; progress = 0.5 }
-
-        await MainActor.run { state = .restartingAudio; progress = 0.7 }
-
-        // Wait for audio system to restart
-        print("Waiting for audio system to restart...")
-        try await Task.sleep(nanoseconds: 1_000_000_000) // 1 second
-
-        await MainActor.run { state = .verifying; progress = 0.9 }
-
-        // Verify installation by checking if file exists (fast check)
-        let driverPath = "\(driverDestination)/\(driverName)"
-        if FileManager.default.fileExists(atPath: driverPath) {
-            print("Driver verified: file exists at \(driverPath)")
-        } else {
-            throw DriverInstallError.copyFailed("Driver file not found after installation")
-        }
-
-        await MainActor.run { state = .complete; progress = 1.0 }
-        print("Driver installed successfully")
+    func currentAction() -> DriverAction {
+        return VersionManager.currentDriverAction()
     }
 
-    /// Check if driver is currently loaded
-    func isDriverLoaded() -> Bool {
-        let task = Process()
-        task.launchPath = "/usr/sbin/system_profiler"
-        task.arguments = ["SPAudioDataType"]
-
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = Pipe()
-
+    func perform(_ operation: DriverOperation) async throws -> DriverInstallResult {
+        state = .authorizing
+        progress = 0.2
         do {
-            try task.run()
-            task.waitUntilExit()
-
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            if let output = String(data: data, encoding: .utf8) {
-                return output.contains("SoundBridge")
-            }
+            let result = try await run(operation)
+            state = .complete
+            progress = 1.0
+            return result
+        } catch DriverInstallError.cancelled {
+            state = .notStarted
+            progress = 0.0
+            throw DriverInstallError.cancelled
         } catch {
-            print("Failed to check driver status: \(error)")
+            state = .failed(error.localizedDescription)
+            progress = 0.0
+            throw error
+        }
+    }
+
+    private func run(_ operation: DriverOperation) async throws -> DriverInstallResult {
+        let teamIdentifier = CodeIdentity.currentTeamIdentifier()
+        var arguments = [operation.rawValue, "", "", "0", teamIdentifier ?? ""]
+        var expected: DriverIdentity?
+
+        if operation != .uninstall {
+            guard let source = VersionManager.bundledDriverPath(),
+                  let bundled = VersionManager.driverIdentity(atBundlePath: source),
+                  let protocolVersion = bundled.protocolVersion else {
+                throw DriverInstallError.driverNotFound
+            }
+            if let installed = VersionManager.installedDriverIdentity(),
+               VersionManager.isVersionOlder(bundled.version, than: installed.version),
+               installed.protocolVersion != bundled.protocolVersion {
+                throw DriverInstallError.downgradeRefused(installed.version)
+            }
+            // Early UI-side check only; the privileged script re-verifies the staged copy.
+            if let teamIdentifier, !CodeIdentity.verifyDriverSignature(at: source, teamIdentifier: teamIdentifier) {
+                throw DriverInstallError.signatureInvalid
+            }
+            arguments = [operation.rawValue, source, bundled.version, String(protocolVersion), teamIdentifier ?? ""]
+            expected = bundled
         }
 
-        return false
+        switch PrivilegedRunner.run(script: DriverInstallScript.source, arguments: arguments) {
+        case .success:
+            break
+        case .failure(.cancelled):
+            throw DriverInstallError.cancelled
+        case .failure(.failed(let code, let message)):
+            throw DriverInstallError.privilegedStepFailed(DriverInstallScript.exitCodeMessages[code] ?? message)
+        }
+
+        state = .verifying
+        progress = 0.8
+        guard let expected else {
+            guard !VersionManager.installedDriverExists() else { throw DriverInstallError.uninstallFailed("driver still present") }
+            return .removed
+        }
+        return try await verifyInstalled(expected, teamIdentifier: teamIdentifier)
     }
 
-    /// Check if driver is installed (file exists)
-    func isDriverInstalled() -> Bool {
-        let driverPath = "\(driverDestination)/\(driverName)"
-        return FileManager.default.fileExists(atPath: driverPath)
-    }
+    private func verifyInstalled(_ expected: DriverIdentity, teamIdentifier: String?) async throws -> DriverInstallResult {
+        guard VersionManager.installedDriverIdentity() == expected else {
+            throw DriverInstallError.verificationFailed
+        }
+        if let teamIdentifier,
+           !CodeIdentity.verifyDriverSignature(at: VersionManager.installedDriverPath, teamIdentifier: teamIdentifier) {
+            throw DriverInstallError.signatureInvalid
+        }
 
-    /// Find driver bundle in app resources
-    private func findDriverBundle() -> String? {
-        // For development: check if running from build directory
-        if let bundlePath = Bundle.main.resourcePath {
-            let driverPath = "\(bundlePath)/\(driverName)"
-            if FileManager.default.fileExists(atPath: driverPath) {
-                return driverPath
+        // Success means the expected driver is running, not merely on disk.
+        let deadline = Date().addingTimeInterval(loadTimeout)
+        while true {
+            switch VersionManager.loadedDriverState() {
+            case .identified(let loaded):
+                guard loaded == expected else { throw DriverInstallError.staleDriverLoaded(loaded.version) }
+                return .verified(expected)
+            case .unidentified:
+                throw DriverInstallError.staleDriverLoaded("an older build")
+            case .notLoaded:
+                guard Date() < deadline else { throw DriverInstallError.loadUnconfirmed }
+                try await Task.sleep(nanoseconds: 250_000_000)
             }
         }
-
-        // For production: driver should be in Resources
-        if let resourcePath = Bundle.main.path(forResource: "SoundBridgeDriver", ofType: "driver") {
-            return resourcePath
-        }
-
-        print("WARNING: Driver bundle not found in app resources")
-        return nil
-    }
-
-    /// Install driver with single admin prompt (combines copy, permissions, and restart)
-    private func installDriverWithPrivileges(from source: String) async throws {
-        // Escape single quotes in paths for shell
-        let escapedSource = source.replacingOccurrences(of: "'", with: "'\\''")
-        let escapedDest = driverDestination.replacingOccurrences(of: "'", with: "'\\''")
-        let driverPath = "\(driverDestination)/\(driverName)"
-        let escapedDriverPath = driverPath.replacingOccurrences(of: "'", with: "'\\''")
-
-        // Combine all operations into single command chain
-        let script = """
-        do shell script "cp -R '\(escapedSource)' '\(escapedDest)/' && \
-        chown -R root:wheel '\(escapedDriverPath)' && \
-        chmod -R 755 '\(escapedDriverPath)' && \
-        killall coreaudiod" with administrator privileges
-        """
-
-        // Run AppleScript on background queue to avoid blocking UI
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            DispatchQueue.global(qos: .userInitiated).async {
-                let appleScript = NSAppleScript(source: script)
-                var errorDict: NSDictionary?
-                appleScript?.executeAndReturnError(&errorDict)
-
-                if let errorDict = errorDict,
-                   let errorMessage = errorDict["NSAppleScriptErrorMessage"] as? String {
-                    print("Failed to install driver: \(errorMessage)")
-                    continuation.resume(throwing: DriverInstallError.copyFailed(errorMessage))
-                } else {
-                    print("Driver installed and coreaudiod restarted")
-                    continuation.resume()
-                }
-            }
-        }
-    }
-
-    /// Copy driver using AppleScript with admin privileges
-    @MainActor
-    private func copyDriverWithPrivileges(from source: String) async throws {
-        // Escape single quotes in paths for shell
-        let escapedSource = source.replacingOccurrences(of: "'", with: "'\\''")
-        let escapedDest = driverDestination.replacingOccurrences(of: "'", with: "'\\''")
-
-        let script = "do shell script \"cp -R '\(escapedSource)' '\(escapedDest)/'\" with administrator privileges"
-
-        let appleScript = NSAppleScript(source: script)
-
-        // Execute on main thread (AppleScript requires it)
-        var errorDict: NSDictionary?
-        appleScript?.executeAndReturnError(&errorDict)
-
-        if let errorDict = errorDict,
-           let errorMessage = errorDict["NSAppleScriptErrorMessage"] as? String {
-            print("Failed to copy driver: \(errorMessage)")
-            throw DriverInstallError.copyFailed(errorMessage)
-        }
-    }
-
-    /// Set driver permissions using AppleScript
-    @MainActor
-    private func setDriverPermissions() async throws {
-        let driverPath = "\(driverDestination)/\(driverName)"
-        let escapedPath = driverPath.replacingOccurrences(of: "'", with: "'\\''")
-
-        let script = "do shell script \"chown -R root:wheel '\(escapedPath)' && chmod -R 755 '\(escapedPath)'\" with administrator privileges"
-
-        let appleScript = NSAppleScript(source: script)
-
-        // Execute on main thread (AppleScript requires it)
-        var errorDict: NSDictionary?
-        appleScript?.executeAndReturnError(&errorDict)
-
-        if let errorDict = errorDict,
-           let errorMessage = errorDict["NSAppleScriptErrorMessage"] as? String {
-            print("Failed to set permissions: \(errorMessage)")
-            throw DriverInstallError.permissionsFailed(errorMessage)
-        }
-    }
-
-    /// Restart coreaudiod using AppleScript
-    @MainActor
-    private func restartAudio() async throws {
-        let script = "do shell script \"killall coreaudiod\" with administrator privileges"
-
-        let appleScript = NSAppleScript(source: script)
-
-        // Execute on main thread (AppleScript requires it)
-        var errorDict: NSDictionary?
-        appleScript?.executeAndReturnError(&errorDict)
-
-        if let errorDict = errorDict,
-           let errorMessage = errorDict["NSAppleScriptErrorMessage"] as? String {
-            print("Failed to restart coreaudiod: \(errorMessage)")
-            throw DriverInstallError.audioRestartFailed(errorMessage)
-        }
-
-        print("coreaudiod restarted")
-    }
-
-    /// Uninstall driver (for testing)
-    func uninstallDriver() throws {
-        let driverPath = "\(driverDestination)/\(driverName)"
-        let escapedPath = driverPath.replacingOccurrences(of: "'", with: "'\\''")
-
-        let script = "do shell script \"rm -rf '\(escapedPath)'\" with administrator privileges"
-
-        let appleScript = NSAppleScript(source: script)
-        var errorDict: NSDictionary?
-        appleScript?.executeAndReturnError(&errorDict)
-
-        if let errorDict = errorDict {
-            let errorMessage = errorDict["NSAppleScriptErrorMessage"] as? String ?? "Unknown error"
-            throw DriverInstallError.uninstallFailed(errorMessage)
-        }
-
-        print("Driver uninstalled")
     }
 }
 
-/// Driver installation errors
-enum DriverInstallError: Error, LocalizedError {
+enum DriverInstallError: Error, LocalizedError, Equatable {
+    case cancelled
     case driverNotFound
-    case copyFailed(String)
-    case permissionsFailed(String)
-    case audioRestartFailed(String)
+    case downgradeRefused(String)
+    case signatureInvalid
+    case privilegedStepFailed(String)
     case verificationFailed
+    case staleDriverLoaded(String)
+    case loadUnconfirmed
     case uninstallFailed(String)
 
     var errorDescription: String? {
         switch self {
+        case .cancelled:
+            return "Authorization was cancelled. Nothing was changed."
         case .driverNotFound:
-            return "Driver bundle not found in app resources"
-        case .copyFailed(let message):
-            return "Failed to copy driver: \(message)"
-        case .permissionsFailed(let message):
-            return "Failed to set permissions: \(message)"
-        case .audioRestartFailed(let message):
-            return "Failed to restart audio system: \(message)"
+            return "This copy of SoundBridge does not contain a valid audio driver."
+        case .downgradeRefused(let version):
+            return "A newer, incompatible driver (\(version)) is installed. Update SoundBridge instead."
+        case .signatureInvalid:
+            return "The audio driver is not signed by the same developer as SoundBridge."
+        case .privilegedStepFailed(let message):
+            return message
         case .verificationFailed:
-            return "Driver installation could not be verified"
+            return "The installed driver does not match the expected version."
+        case .staleDriverLoaded(let version):
+            return "Core Audio is still running \(version) of the driver. Restart your Mac to finish the update."
+        case .loadUnconfirmed:
+            return "The driver was installed but Core Audio has not loaded it. Restart your Mac to finish the update."
         case .uninstallFailed(let message):
-            return "Failed to uninstall driver: \(message)"
+            return "Failed to remove the driver: \(message)"
         }
     }
 }
