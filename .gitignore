@@ -46,6 +46,8 @@ playground.xcworkspace
 # Packages/ -- commented out to not ignore our packages/ directory
 Package.pins
 Package.resolved
+# Dependency locks for shipped code are reviewed and committed.
+!apps/mac/SoundBridgeApp/Package.resolved
 
 # CocoaPods
 Pods/
@@ -133,3 +135,6 @@ diagnostics/
 *.crash
 *.diag
 .env
+
+# Native protocol test builds
+packages/driver/tests/build-*/
