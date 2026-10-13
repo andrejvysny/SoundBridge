@@ -47,14 +47,15 @@ verify_component() {
     info "Verifying $name..."
 
     if [ ! -e "$component" ]; then
-        warn "$name not found (optional)"
+        error "$name not found"
+        FAILED=$((FAILED + 1))
         return 0
     fi
 
     # Check if signed
     if ! codesign -dv "$component" 2>&1 | grep -q "Signature"; then
         error "$name is NOT signed"
-        ((FAILED++))
+        FAILED=$((FAILED + 1))
         return 1
     fi
 
@@ -64,7 +65,7 @@ verify_component() {
     else
         error "$name signature verification FAILED"
         codesign --verify --deep --strict --verbose=2 "$component" 2>&1 || true
-        ((FAILED++))
+        FAILED=$((FAILED + 1))
         return 1
     fi
 
@@ -92,6 +93,35 @@ verify_component() {
     fi
 }
 
+# Runtime exceptions that no SoundBridge executable may carry. Adding one
+# requires a documented justification in SECURITY.md and an update here.
+FORBIDDEN_ENTITLEMENTS=(
+    com.apple.security.cs.disable-library-validation
+    com.apple.security.cs.allow-unsigned-executable-memory
+    com.apple.security.cs.allow-jit
+    com.apple.security.cs.allow-dyld-environment-variables
+    com.apple.security.cs.disable-executable-page-protection
+    com.apple.security.get-task-allow
+    com.apple.security.device.audio-input
+)
+
+check_entitlements() {
+    local component="$1"
+    local name="$2"
+    local entitlements
+    entitlements=$(codesign -d --entitlements - --xml "$component" 2>/dev/null | plutil -convert json -o - - 2>/dev/null || echo "{}")
+    for key in "${FORBIDDEN_ENTITLEMENTS[@]}"; do
+        if printf '%s' "$entitlements" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get(sys.argv[1]) is True else 1)' "$key"; then
+            error "$name has forbidden entitlement $key"
+            FAILED=$((FAILED + 1))
+        fi
+    done
+}
+
+team_of() {
+    codesign -dv "$1" 2>&1 | sed -n 's/^TeamIdentifier=//p'
+}
+
 # Verify each component
 verify_component "$APP_BUNDLE/Contents/MacOS/SoundBridgeHost" "SoundBridgeHost"
 verify_component "$APP_BUNDLE/Contents/MacOS/SoundBridgeApp" "SoundBridgeApp"
@@ -105,6 +135,30 @@ else
 fi
 verify_component "$APP_BUNDLE" "SoundBridge.app (bundle)"
 
+section "Entitlements and Team Identity"
+check_entitlements "$APP_BUNDLE/Contents/MacOS/SoundBridgeHost" "SoundBridgeHost"
+check_entitlements "$APP_BUNDLE/Contents/MacOS/SoundBridgeApp" "SoundBridgeApp"
+check_entitlements "$APP_BUNDLE" "SoundBridge.app"
+
+APP_TEAM=$(team_of "$APP_BUNDLE")
+for component in \
+    "$APP_BUNDLE/Contents/MacOS/SoundBridgeHost" \
+    "$APP_BUNDLE/Contents/Resources/SoundBridgeDriver.driver"; do
+    if [ -e "$component" ] && [ "$(team_of "$component")" != "$APP_TEAM" ]; then
+        error "$(basename "$component") is not signed by the app's team ($APP_TEAM)"
+        FAILED=$((FAILED + 1))
+    fi
+done
+if [ -z "$APP_TEAM" ] || [ "$APP_TEAM" = "not set" ]; then
+    error "App bundle has no Team ID"
+    FAILED=$((FAILED + 1))
+fi
+DRIVER_ID=$(codesign -dv "$APP_BUNDLE/Contents/Resources/SoundBridgeDriver.driver" 2>&1 | sed -n 's/^Identifier=//p')
+if [ "$DRIVER_ID" != "com.soundbridge.driver" ]; then
+    error "Driver signing identifier is '$DRIVER_ID', expected com.soundbridge.driver"
+    FAILED=$((FAILED + 1))
+fi
+
 section "Gatekeeper Assessment"
 
 if spctl --assess --type execute --verbose=4 "$APP_BUNDLE" 2>&1; then
@@ -116,7 +170,7 @@ else
         echo "   Run notarization after signing: ./tools/notarize.sh"
     else
         error "Gatekeeper: REJECTED (signature issue)"
-        ((FAILED++))
+        FAILED=$((FAILED + 1))
     fi
 fi
 

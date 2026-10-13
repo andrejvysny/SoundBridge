@@ -2,7 +2,7 @@
 # Code signing script for SoundBridge
 # Signs all components with Developer ID certificate
 
-set -e  # Exit on error
+set -euo pipefail
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
@@ -46,6 +46,10 @@ if [ ! -d "$APP_BUNDLE" ]; then
 fi
 
 # Determine signing identity
+APPLE_DEVELOPER_ID="${APPLE_DEVELOPER_ID:-}"
+APPLE_CERTIFICATE="${APPLE_CERTIFICATE:-}"
+APPLE_CERTIFICATE_PASSWORD="${APPLE_CERTIFICATE_PASSWORD:-}"
+
 if [ -n "$APPLE_DEVELOPER_ID" ]; then
     # Use provided Developer ID directly
     SIGNING_IDENTITY="$APPLE_DEVELOPER_ID"
@@ -62,16 +66,19 @@ elif [ -n "$APPLE_CERTIFICATE" ] && [ -n "$APPLE_CERTIFICATE_PASSWORD" ]; then
     security set-keychain-settings -lut 21600 signing.keychain
     security unlock-keychain -p "$KEYCHAIN_PASSWORD" signing.keychain
 
-    # Decode and import certificate
-    echo "$APPLE_CERTIFICATE" | base64 --decode > certificate.p12
-    security import certificate.p12 -k signing.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+    # Decode into a private temporary file that is always removed.
+    CERT_DIR=$(mktemp -d)
+    trap 'rm -rf "$CERT_DIR"; security delete-keychain signing.keychain 2>/dev/null || true' EXIT
+    CERT_FILE="$CERT_DIR/certificate.p12"
+    ( umask 077; printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$CERT_FILE" )
+    security import "$CERT_FILE" -k signing.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
     security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" signing.keychain
 
     # Add to search list
     security list-keychains -d user -s signing.keychain login.keychain
 
     # Find the identity
-    SIGNING_IDENTITY=$(security find-identity -v -p codesigning signing.keychain | grep "Developer ID Application" | head -1 | awk '{print $2}')
+    SIGNING_IDENTITY=$(security find-identity -v -p codesigning signing.keychain | grep "Developer ID Application" | head -1 | awk '{print $2}' || true)
 
     if [ -z "$SIGNING_IDENTITY" ]; then
         error "Could not find Developer ID Application certificate in keychain"
@@ -81,13 +88,12 @@ elif [ -n "$APPLE_CERTIFICATE" ] && [ -n "$APPLE_CERTIFICATE_PASSWORD" ]; then
     success "Certificate imported successfully"
     echo "Using identity: $SIGNING_IDENTITY"
 
-    # Cleanup certificate file
-    rm -f certificate.p12
+    rm -f "$CERT_FILE"
 else
     # Try to find installed Developer ID certificate
     section "Looking for Developer ID Certificate"
 
-    SIGNING_IDENTITY=$(security find-identity -v -p codesigning | grep "Developer ID Application" | head -1 | awk '{print $2}')
+    SIGNING_IDENTITY=$(security find-identity -v -p codesigning | grep "Developer ID Application" | head -1 | awk '{print $2}' || true)
 
     if [ -z "$SIGNING_IDENTITY" ]; then
         error "No Developer ID certificate found and no credentials provided"
@@ -130,7 +136,11 @@ else
     exit 1
 fi
 
-# Step 2: Sign SoundBridgeDriver.driver bundle (if present)
+# Step 2: Sign SoundBridgeDriver.driver bundle (required: the app installs it)
+if [ ! -d "$APP_BUNDLE/Contents/Resources/SoundBridgeDriver.driver" ]; then
+    error "SoundBridgeDriver.driver missing from bundle"
+    exit 1
+fi
 if [ -d "$APP_BUNDLE/Contents/Resources/SoundBridgeDriver.driver" ]; then
     echo " Signing SoundBridgeDriver.driver..."
 
@@ -146,7 +156,7 @@ if [ -d "$APP_BUNDLE/Contents/Resources/SoundBridgeDriver.driver" ]; then
     fi
 
     # Sign the driver bundle
-    if codesign "${SIGN_OPTS[@]}" \
+    if codesign "${SIGN_OPTS[@]}" --identifier com.soundbridge.driver \
         "$APP_BUNDLE/Contents/Resources/SoundBridgeDriver.driver"; then
         success "SoundBridgeDriver.driver bundle signed"
     else
@@ -262,7 +272,3 @@ echo "  2. Notarize for distribution: ./tools/notarize.sh"
 echo "  3. Create DMG: ./tools/create_dmg.sh"
 echo ""
 
-# Cleanup temporary keychain if created
-if [ -n "$APPLE_CERTIFICATE" ]; then
-    security delete-keychain signing.keychain 2>/dev/null || true
-fi

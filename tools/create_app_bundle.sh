@@ -2,7 +2,19 @@
 # Create proper .app bundle structure for SoundBridge
 # Supports universal binaries (arm64 + x86_64)
 
-set -e  # Exit on error
+set -euo pipefail
+
+# Release builds set REQUIRE_RELEASE_COMPONENTS=1: a missing driver, Sparkle
+# framework, or update channel (SPARKLE_FEED_URL / SPARKLE_PUBLIC_ED_KEY) is fatal
+# instead of silently producing an app that cannot deliver driver or app updates.
+REQUIRE_RELEASE_COMPONENTS="${REQUIRE_RELEASE_COMPONENTS:-0}"
+SPARKLE_FEED_URL="${SPARKLE_FEED_URL:-}"
+SPARKLE_PUBLIC_ED_KEY="${SPARKLE_PUBLIC_ED_KEY:-}"
+
+release_fail() {
+    echo "  Error: $1" >&2
+    exit 1
+}
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
@@ -73,6 +85,22 @@ echo "  Created bundle structure"
 # Copy Info.plist
 echo "  Copying Info.plist..."
 cp "$PROJECT_ROOT/apps/mac/SoundBridgeApp/Info.plist" "$APP_PATH/Contents/Info.plist"
+if [ -n "$SPARKLE_FEED_URL" ] || [ -n "$SPARKLE_PUBLIC_ED_KEY" ]; then
+    case "$SPARKLE_FEED_URL" in
+        https://*) ;;
+        *) release_fail "SPARKLE_FEED_URL must be an https URL" ;;
+    esac
+    if [ "$(printf '%s' "$SPARKLE_PUBLIC_ED_KEY" | base64 -D 2>/dev/null | wc -c | tr -d ' ')" != "32" ]; then
+        release_fail "SPARKLE_PUBLIC_ED_KEY must be a base64 Ed25519 public key"
+    fi
+    /usr/libexec/PlistBuddy -c "Set :SUFeedURL $SPARKLE_FEED_URL" "$APP_PATH/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c "Set :SUPublicEDKey $SPARKLE_PUBLIC_ED_KEY" "$APP_PATH/Contents/Info.plist"
+    echo "  Update channel configured"
+elif [ "$REQUIRE_RELEASE_COMPONENTS" = "1" ]; then
+    release_fail "SPARKLE_FEED_URL and SPARKLE_PUBLIC_ED_KEY are required for release bundles"
+else
+    echo "  Update channel not configured (Sparkle stays disabled in this build)"
+fi
 echo "  Info.plist copied"
 
 # Copy app icon
@@ -140,9 +168,9 @@ echo "  Copying SoundBridgeDriver.driver..."
 DRIVER_BUNDLE="$PROJECT_ROOT/packages/driver/build/SoundBridgeDriver.driver"
 
 if [ ! -d "$DRIVER_BUNDLE" ]; then
-    echo "  SoundBridgeDriver.driver not found - will need to be installed separately"
-    echo "   Note: Driver installation will be handled during onboarding"
-    echo "   For development, build with: cd packages/driver && ./install.sh"
+    [ "$REQUIRE_RELEASE_COMPONENTS" = "1" ] && release_fail "SoundBridgeDriver.driver is required for release bundles"
+    echo "  SoundBridgeDriver.driver not found - onboarding will not be able to install it"
+    echo "   Build it with: cmake -S packages/driver -B packages/driver/build && cmake --build packages/driver/build"
 else
     cp -R "$DRIVER_BUNDLE" "$APP_PATH/Contents/Resources/SoundBridgeDriver.driver"
     echo "  SoundBridgeDriver.driver copied"
@@ -176,10 +204,19 @@ mkdir -p "$APP_PATH/Contents/Frameworks"
 
 SPARKLE_FRAMEWORK=$(find_swift_product "$PROJECT_ROOT/apps/mac/SoundBridgeApp" "Sparkle.framework")
 
-if [ -d "$SPARKLE_FRAMEWORK" ]; then
+if [ -n "$SPARKLE_FRAMEWORK" ] && [ -d "$SPARKLE_FRAMEWORK" ]; then
     cp -R "$SPARKLE_FRAMEWORK" "$APP_PATH/Contents/Frameworks/"
-    echo "  Sparkle.framework copied"
+    # The embedded framework must be exactly the reviewed, locked version.
+    EMBEDDED_SPARKLE=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" \
+        "$APP_PATH/Contents/Frameworks/Sparkle.framework/Resources/Info.plist" 2>/dev/null || echo "unknown")
+    LOCKED_SPARKLE=$(python3 -c 'import json,sys; pins=json.load(open(sys.argv[1]))["pins"]; print(next(p["state"]["version"] for p in pins if p["identity"]=="sparkle"))' \
+        "$PROJECT_ROOT/apps/mac/SoundBridgeApp/Package.resolved" 2>/dev/null || echo "unknown")
+    echo "  Sparkle.framework copied (embedded $EMBEDDED_SPARKLE, locked $LOCKED_SPARKLE)"
+    if [ "$REQUIRE_RELEASE_COMPONENTS" = "1" ] && [ "$EMBEDDED_SPARKLE" != "$LOCKED_SPARKLE" ]; then
+        release_fail "embedded Sparkle $EMBEDDED_SPARKLE does not match Package.resolved $LOCKED_SPARKLE"
+    fi
 else
+    [ "$REQUIRE_RELEASE_COMPONENTS" = "1" ] && release_fail "Sparkle.framework is required for release bundles"
     echo "  Sparkle.framework not found"
     echo "   Searched in: $PROJECT_ROOT/apps/mac/SoundBridgeApp/.build/"
 fi

@@ -2,7 +2,7 @@
 # Master build script for SoundBridge release builds
 # Builds all components as universal binaries (arm64 + x86_64)
 
-set -e  # Exit on error
+set -euo pipefail
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
@@ -26,11 +26,12 @@ build_swift_universal() {
 
     cd "$PACKAGE_DIR"
 
+    # --force-resolved-versions: build exactly what Package.resolved locks.
     echo "  Building arm64..."
-    swift build -c release --triple arm64-apple-macosx 2>&1 | tail -1
+    swift build -c release --force-resolved-versions --triple arm64-apple-macosx 2>&1 | tail -1
 
     echo "  Building x86_64..."
-    swift build -c release --triple x86_64-apple-macosx 2>&1 | tail -1
+    swift build -c release --force-resolved-versions --triple x86_64-apple-macosx 2>&1 | tail -1
 
     local ARM64_BIN=".build/arm64-apple-macosx/release/$PRODUCT_NAME"
     local X86_BIN=".build/x86_64-apple-macosx/release/$PRODUCT_NAME"
