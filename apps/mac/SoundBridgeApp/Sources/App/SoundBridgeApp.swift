@@ -19,6 +19,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var driverUpdateWindow: DriverUpdateWindow?
     /// Set during uninstall so the host's exit does not quit the app early.
     var isUninstalling = false
+    private var hostRestartTimes: [Date] = []
+    private static let maxHostRestarts = 3
+    private static let hostRestartWindow: TimeInterval = 60
+    private static let hostRestartDelay: TimeInterval = 2
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         registerCustomFont()
@@ -27,7 +31,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         hostController.onUnexpectedExit = { [weak self] status in
             guard let self, !self.isUninstalling, status != HostProcessController.exitCodeAlreadyRunning else { return }
-            NSApp.terminate(nil)
+            self.restartHostAfterCrash()
         }
 
         if !OnboardingState.hasCompleted() {
@@ -38,6 +42,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Onboarding complete - run as menu bar app only
         NSApp.setActivationPolicy(.accessory)
+        LaunchAtLogin.shared.enableOnFirstRun()
 
         checkDriverStatus()
         launchHostIfNeeded()
@@ -86,6 +91,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return false
         }
         return true
+    }
+
+    /// The host owns the audio path, so a crash is recovered rather than ending
+    /// the app. A crash loop still quits instead of restarting forever.
+    func restartHostAfterCrash() {
+        let now = Date()
+        hostRestartTimes = hostRestartTimes.filter { now.timeIntervalSince($0) < Self.hostRestartWindow }
+        guard hostRestartTimes.count < Self.maxHostRestarts else {
+            showAlert("SoundBridge Stopped", "The audio host keeps exiting, so SoundBridge has stopped. Audio plays directly on your devices.")
+            NSApp.terminate(nil)
+            return
+        }
+        hostRestartTimes.append(now)
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.hostRestartDelay) { [weak self] in
+            guard let self, !self.isUninstalling else { return }
+            self.launchHostIfNeeded()
+        }
     }
 
     func launchHostIfNeeded() {

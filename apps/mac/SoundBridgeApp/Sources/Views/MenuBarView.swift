@@ -69,7 +69,11 @@ struct MenuBarView: View {
             Divider()
                 .padding(.horizontal, 12)
 
-            // 3. Reconnect audio + Footer
+            // 3. Login item, reconnect audio, footer
+            LaunchAtLoginRow()
+                .padding(.horizontal, 16)
+                .padding(.vertical, 6)
+
             ReconnectAudioButton()
                 .padding(.horizontal, 8)
                 .padding(.vertical, 4)
@@ -239,6 +243,27 @@ struct DeviceRow: View {
         }
         .buttonStyle(.plain)
         .onHover { hovering in isHovered = hovering }
+    }
+}
+
+// MARK: - Launch at Login
+
+struct LaunchAtLoginRow: View {
+    @ObservedObject private var launchAtLogin = LaunchAtLogin.shared
+
+    var body: some View {
+        HStack {
+            Text("Open at Login")
+                .font(.system(size: 12))
+            Spacer()
+            Toggle("", isOn: Binding(
+                get: { launchAtLogin.isEnabled },
+                set: { launchAtLogin.setEnabled($0) }
+            ))
+            .toggleStyle(.switch)
+            .controlSize(.mini)
+            .labelsHidden()
+        }
     }
 }
 

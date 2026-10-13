@@ -45,6 +45,8 @@ enum UninstallCoordinator {
                 return
             }
 
+            // Without the driver the app has nothing to do at login.
+            LaunchAtLogin.shared.setEnabled(false)
             let failures = deleteData ? UserDataEraser.eraseAll() : []
             var message = "The SoundBridge driver was removed."
             if deleteData {
