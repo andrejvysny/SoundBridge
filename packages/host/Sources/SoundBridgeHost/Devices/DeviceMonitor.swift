@@ -13,6 +13,8 @@ class DeviceMonitor {
     private var lastHandledDeviceID: AudioDeviceID = 0
     private var lastHandledTime: Date = .distantPast
     private let callbackDebounce: TimeInterval = 0.3
+    /// Longer than ProxyDeviceManager's switch cooldown (0.5 s).
+    private let reconcileRetryDelay: TimeInterval = 0.7
     private var listenersRegistered = false
     private var devicesListenerRegistered = false
     private var defaultOutputListenerRegistered = false
@@ -146,8 +148,11 @@ class DeviceMonitor {
             print("Device removed: \(device.name) (\(discovery.transportTypeName(device.transportType)))")
         }
 
-        // 2. Update registry (writes control file + sends Darwin notification)
-        registry.update(newDevices)
+        // 2. Update registry (writes control file + sends Darwin notification).
+        // Skipped when only proxies changed, so proxy arrival does not re-notify the driver.
+        if !addedDevices.isEmpty || !removedDevices.isEmpty {
+            registry.update(newDevices)
+        }
 
         // 3. Delay shared memory removal for removed devices. The token is
         // captured now so a replug before the delay expires keeps its mapping.
@@ -163,11 +168,59 @@ class DeviceMonitor {
             }
         }
 
-        // 4. Wait for proxy devices and auto-switch for new devices
-        if !addedDevices.isEmpty {
-            waitForProxyAndSwitch(addedDevices: addedDevices)
+        // 4. Proxies are published asynchronously (driver poll + re-add
+        // cooldown); their arrival is itself a device-list change, so
+        // reconciling here catches them without a fixed wait.
+        reconcileDefaultOutput()
+    }
+
+    /// Moves the system output onto the SoundBridge proxy whenever the
+    /// default is a known physical device whose proxy exists. Follows the
+    /// system's choice of device; never picks a different one.
+    func reconcileDefaultOutput(retryIfDeferred: Bool = true) {
+        guard !proxyManager.isDeviceBouncing,
+              let physicalUID = currentDefaultPhysicalUIDWithProxy() else { return }
+
+        proxyManager.handlePhysicalSelection(physicalUID)
+
+        // handlePhysicalSelection skips during its switch cooldown; try once more after it.
+        guard retryIfDeferred else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + reconcileRetryDelay) { [weak self] in
+            self?.reconcileDefaultOutput(retryIfDeferred: false)
         }
-        // NOTE: reloadDriver() removed — Darwin notifications replace manual reload
+    }
+
+    private func currentDefaultPhysicalUIDWithProxy() -> String? {
+        guard let deviceID = currentDefaultOutputDevice(),
+              let name = getDeviceName(deviceID),
+              !name.contains("SoundBridge"),
+              let uid = getDeviceUID(deviceID),
+              registry.find(uid: uid) != nil,
+              proxyManager.findProxyDevice(forPhysicalUID: uid) != nil else {
+            return nil
+        }
+        return uid
+    }
+
+    private func currentDefaultOutputDevice() -> AudioDeviceID? {
+        var propertyAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var deviceID: AudioDeviceID = 0
+        var dataSize = UInt32(MemoryLayout<AudioDeviceID>.size)
+        guard AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &propertyAddress,
+            0,
+            nil,
+            &dataSize,
+            &deviceID
+        ) == noErr, deviceID != 0 else {
+            return nil
+        }
+        return deviceID
     }
 
     fileprivate func handleDefaultOutputChanged() {
@@ -233,36 +286,6 @@ class DeviceMonitor {
                 }
             }
         }
-    }
-
-    private func waitForProxyAndSwitch(addedDevices: [PhysicalDevice]) {
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self else { return }
-
-            let deadline = Date().addingTimeInterval(SoundBridgeConfig.deviceWaitTimeout)
-
-            for device in addedDevices {
-                var proxyID: AudioDeviceID? = nil
-
-                while Date() < deadline {
-                    proxyID = self.proxyManager.findProxyDevice(forPhysicalUID: device.uid)
-                    if proxyID != nil { break }
-                    Thread.sleep(forTimeInterval: 0.1)
-                }
-
-                if proxyID != nil {
-                    DispatchQueue.main.async {
-                        self.proxyManager.handlePhysicalSelection(device.uid)
-                    }
-                } else {
-                    logger.warning("Proxy device not found for \(device.name) after \(SoundBridgeConfig.deviceWaitTimeout)s timeout")
-                }
-            }
-        }
-    }
-
-    private func reloadDriver() {
-        print("Driver reload required - restart coreaudiod with: sudo killall coreaudiod")
     }
 
     private func getDeviceName(_ deviceID: AudioDeviceID) -> String? {
