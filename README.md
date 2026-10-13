@@ -55,7 +55,7 @@ SoundBridge uses a four-component architecture:
 ```
 ┌─────────────────┐     ┌──────────────────────┐     shared memory     ┌─────────────────┐     ┌─────────────────┐
 │   Menu Bar App   │────▶│   HAL Virtual Driver  │◀──────────────────▶│   Host Engine    │────▶│  Physical Device │
-│   (SwiftUI)      │     │   (C++ CoreAudio)     │    /tmp/soundbridge  │   (Swift)        │     │  (HDMI/DP)       │
+│   (SwiftUI)      │     │   (C++ CoreAudio)     │  per-user session   │   (Swift)        │     │  (HDMI/DP)       │
 └─────────────────┘     └──────────────────────┘                      └─────────────────┘     └─────────────────┘
        UI controls              Proxy device                            DSP + rendering
        volume/mute              captures audio                          gain + EQ
@@ -73,7 +73,7 @@ SoundBridge uses a four-component architecture:
 ### Audio Chain
 
 1. macOS routes audio to the SoundBridge proxy device (appears as "Device via SoundBridge")
-2. The HAL driver writes audio frames into a shared memory ring buffer (`/tmp/soundbridge-<uid>`)
+2. The HAL driver writes audio frames into a shared memory ring buffer in the user's private session directory (`/private/tmp/com.soundbridge.<uid>/`, see [SECURITY.md](SECURITY.md))
 3. The Host process reads from the ring buffer, applies software gain (from the volume slider) and optional EQ
 4. Processed audio is rendered to the real physical output device
 
